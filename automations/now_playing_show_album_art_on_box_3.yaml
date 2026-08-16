@@ -1,0 +1,58 @@
+# entity_id: automation.now_playing_show_album_art_on_box_3
+
+alias: Now Playing - Show Album Art on BOX-3
+description: |
+  Shows the currently-playing Spotify album art on both S3-Box-3 displays whenever Derek is home and Spotify is playing. Simplified version: the earlier Music Assistant (media_player.kitchen_5 / media_player.living_room_4) branch has been removed - see write-up for why.
+triggers:
+- entity_id: media_player.spotify_derekm7
+  to: playing
+  id: sp_start
+  trigger: state
+- entity_id: media_player.spotify_derekm7
+  attribute: entity_picture
+  id: sp_art
+  trigger: state
+- entity_id: media_player.spotify_derekm7
+  id: sp_stop
+  not_to: playing
+  trigger: state
+- entity_id: person.derek_mcauley
+  to: not_home
+  id: left_home
+  trigger: state
+conditions: []
+actions:
+- choose:
+  - conditions:
+    - condition: trigger
+      id:
+      - sp_start
+      - sp_art
+    - condition: state
+      entity_id: media_player.spotify_derekm7
+      state: playing
+    - condition: state
+      entity_id: person.derek_mcauley
+      state: home
+    - condition: template
+      value_template: '{{ state_attr(''media_player.spotify_derekm7'', ''entity_picture'') is not none
+        }}'
+    sequence:
+    - variables:
+        picture: '{{ state_attr(''media_player.spotify_derekm7'', ''entity_picture'') }}'
+        image_url: '{{ picture if picture.startswith(''http'') else ''http://YOUR_HA_IP:8123'' + picture
+          }}'
+    - parallel:
+      - action: esphome.esp32_s3_box_3_a8afdc_show_now_playing
+        data:
+          image_url: '{{ image_url }}'
+      - action: esphome.esp32_s3_box_3_a8d314_show_now_playing
+        data:
+          image_url: '{{ image_url }}'
+  default:
+  - parallel:
+    - action: esphome.esp32_s3_box_3_a8afdc_clear_now_playing
+      data: {}
+    - action: esphome.esp32_s3_box_3_a8d314_clear_now_playing
+      data: {}
+mode: restart

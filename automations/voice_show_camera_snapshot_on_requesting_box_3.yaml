@@ -1,0 +1,57 @@
+# entity_id: automation.voice_show_camera_snapshot_on_requesting_box_3
+
+alias: Voice - Show Camera Snapshot on Requesting BOX-3
+description: Assist command like 'show me the garden camera' snapshots the matching camera and displays it for 2 minutes on whichever ESP32-S3-BOX-3 heard the request, via the generic show_snapshot ESPHome action.
+triggers:
+- trigger: conversation
+  command:
+  - Show me the {camera} camera
+  - Show the {camera} camera
+  - Show {camera} camera
+  - Display the {camera} camera
+conditions: []
+actions:
+- variables:
+    camera_key: '{{ trigger.slots.camera | lower | trim }}'
+    camera_map:
+      garden: camera.back_garden
+      back garden: camera.back_garden
+      kitchen: camera.kitchen
+      living room: camera.living_room
+      doorbell: camera.doorbell_hd_stream_direct
+      front door: camera.doorbell_hd_stream_direct
+- variables:
+    target_camera: '{{ camera_map.get(camera_key) }}'
+- if:
+  - condition: template
+    value_template: '{{ target_camera is none }}'
+  then:
+  - set_conversation_response: I don't have a camera called {{ camera_key }}.
+  - stop: unknown camera
+  else:
+  - set_conversation_response: Showing the {{ camera_key }} camera.
+  - action: camera.snapshot
+    target:
+      entity_id: '{{ target_camera }}'
+    data:
+      filename: /config/www/voice_camera_snapshot.jpg
+  - delay:
+      seconds: 1
+  - choose:
+    - conditions:
+      - '{{ trigger.device_id == ''9bed690ff5491e88c6a4c9b8345eafbd'' }}'
+      sequence:
+      - action: esphome.esp32_s3_box_3_a8afdc_show_snapshot
+        data:
+          image_url: http://YOUR_HA_IP:8123/local/voice_camera_snapshot.jpg
+          duration_s: 120
+    - conditions:
+      - '{{ trigger.device_id == ''3af6391e5467e8f1bd3aab01cbc8789d'' }}'
+      sequence:
+      - action: esphome.esp32_s3_box_3_a8d314_show_snapshot
+        data:
+          image_url: http://YOUR_HA_IP:8123/local/voice_camera_snapshot.jpg
+          duration_s: 120
+mode: parallel
+max: 10
+category: 01KG9P6H7SAEXWWC55NKBJKCWA

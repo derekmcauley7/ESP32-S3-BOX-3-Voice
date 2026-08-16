@@ -1,0 +1,70 @@
+# entity_id: script.get_weather_forecast
+
+alias: Get Weather Forecast
+description: Get the weather forecast to answer questions about upcoming weather (today, tomorrow, this weekend, this week, tonight, this afternoon, in a few hours, etc). Always call this instead of guessing when asked about the weather.
+fields:
+  forecast_type:
+    name: Forecast Type
+    description: Whether to fetch the daily or hourly forecast. Use "daily" for questions about whole days (today, tomorrow, this weekend, next Monday, this week). Use "hourly" for questions about a specific time of day or the next couple of days hour-by-hour (this morning, tonight, in 3 hours, this afternoon). Default to "daily" if unsure.
+    required: true
+    selector:
+      select:
+        options:
+        - label: Daily (multiple days ahead)
+          value: daily
+        - label: Hourly (next ~48 hours, hour by hour)
+          value: hourly
+sequence:
+- action: weather.get_forecasts
+  target:
+    entity_id: weather.forecast_home
+  data:
+    type: '{{ forecast_type }}'
+  response_variable: forecast_result
+- variables:
+    temp_unit: '{{ state_attr(''weather.forecast_home'', ''temperature_unit'') }}'
+    temp_unit_spoken: '{{ '' degrees Celsius'' if temp_unit == ''°C'' else ('' degrees Fahrenheit'' if temp_unit == ''°F'' else '' '' ~ temp_unit) }}'
+    wind_unit: '{{ state_attr(''weather.forecast_home'', ''wind_speed_unit'') }}'
+    precip_unit: '{{ state_attr(''weather.forecast_home'', ''precipitation_unit'') }}'
+    items: '{{ forecast_result[''weather.forecast_home''].forecast }}'
+    summary: '{%- set ns = namespace(lines=[]) -%}
+
+      {%- set now_local = now() -%}
+
+      {%- set cur_state = states(''weather.forecast_home'') -%}
+
+      {%- set cur_temp = state_attr(''weather.forecast_home'', ''temperature'') -%}
+
+      {%- set cur_humidity = state_attr(''weather.forecast_home'', ''humidity'') -%}
+
+      {%- set ns.lines = ns.lines + [''Current conditions at '' ~ now_local.strftime(''%A %Y-%m-%d %H:%M'') ~ '': '' ~ cur_state ~ '', '' ~ cur_temp ~ temp_unit_spoken ~ '', humidity '' ~ cur_humidity ~ ''%.''] -%}
+
+      {%- set ns.lines = ns.lines + [(forecast_type | capitalize) ~ '' forecast:''] -%}
+
+      {%- for item in items -%}
+
+      {%- set dt = as_datetime(item.datetime) | as_local -%}
+
+      {%- set uv_text = ('', UV index '' ~ item.uv_index) if (item.uv_index is defined and item.uv_index is not none) else '''' -%}
+
+      {%- if forecast_type == ''daily'' -%}
+
+      {%- set line = dt.strftime(''%A %Y-%m-%d'') ~ '': '' ~ item.condition ~ '', high '' ~ item.temperature ~ temp_unit_spoken ~ '' / low '' ~ item.templow ~ temp_unit_spoken ~ '', precipitation '' ~ (item.precipitation | default(0)) ~ precip_unit ~ '', humidity '' ~ item.humidity ~ ''%, wind '' ~ (item.wind_speed | default(''n/a'')) ~ wind_unit ~ uv_text -%}
+
+      {%- else -%}
+
+      {%- set line = dt.strftime(''%A %Y-%m-%d %H:%M'') ~ '': '' ~ item.condition ~ '', '' ~ item.temperature ~ temp_unit_spoken ~ '', precipitation '' ~ (item.precipitation | default(0)) ~ precip_unit ~ '', humidity '' ~ item.humidity ~ ''%, wind '' ~ (item.wind_speed | default(''n/a'')) ~ wind_unit ~ uv_text -%}
+
+      {%- endif -%}
+
+      {%- set ns.lines = ns.lines + [line] -%}
+
+      {%- endfor -%}
+
+      {{ ns.lines | join(''\n'') }}'
+    result:
+      forecast_type: '{{ forecast_type }}'
+      forecast: '{{ summary }}'
+- stop: Forecast retrieved
+  response_variable: result
+mode: single

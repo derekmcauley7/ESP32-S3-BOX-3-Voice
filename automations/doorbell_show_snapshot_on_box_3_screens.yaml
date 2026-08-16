@@ -1,0 +1,36 @@
+# entity_id: automation.doorbell_show_snapshot_on_box_3_screens
+
+alias: Doorbell - Show Snapshot on BOX-3 Screens
+description: When the doorbell button is pressed, grab a fresh snapshot and display it on both ESP32-S3-BOX-3
+  voice satellites for 42 seconds via the generic show_snapshot ESPHome action. Triggers on either the
+  doorbell sound-event sensor or the doorbell lamp switch turning on, whichever fires first.
+triggers:
+- trigger: state
+  entity_id: binary_sensor.doorbell_doorbell
+  to: 'on'
+  id: doorbell_sensor
+- trigger: state
+  entity_id: switch.doorbell_lamp
+  to: 'on'
+  id: doorbell_lamp
+conditions: []
+actions:
+- action: camera.snapshot
+  target:
+    entity_id: camera.doorbell_hd_stream_direct
+  data:
+    filename: /config/www/doorbell_screen_snapshot.jpg
+- delay:
+    seconds: 1
+- parallel:
+  - action: esphome.esp32_s3_box_3_a8afdc_show_snapshot
+    data:
+      image_url: http://YOUR_HA_IP:8123/local/doorbell_screen_snapshot.jpg
+      duration_s: 42
+  - action: esphome.esp32_s3_box_3_a8d314_show_snapshot
+    data:
+      image_url: http://YOUR_HA_IP:8123/local/doorbell_screen_snapshot.jpg
+      duration_s: 42
+mode: single
+max_exceeded: silent
+category: 01KG9P6H7SAEXWWC55NKBJKCWA

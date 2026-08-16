@@ -1,0 +1,104 @@
+# entity_id: automation.voice_show_weather_image_on_requesting_box_3
+
+alias: Voice - Show Weather Image on Requesting BOX-3
+description: 'Shows a weather card on whichever BOX-3 just finished answering, without touching the LLM''s spoken answer. History: originally triggered on script.get_weather_forecast turning "on" — broke on follow-up questions where the LLM reused already-fetched forecast data instead of re-calling the tool. Fixed by triggering on each box''s own assist_satellite reaching "responding" instead, gated on the transcribed question containing a weather keyword. Then found a truncation bug: the transcript sensor used for day-matching (Last Question) truncates to 31 chars for on-screen caption purposes, which cut words like "tomorrow" off entirely on longer questions, silently defaulting to today''s forecast. Fixed by publishing a second, untruncated text_sensor (text_request_full -> "Last Question Full") dedicated to automation use; both Kitchen and Living Room now read from their respective _full sensors. Then found a day-matching bug: day_index only ever checked for the literal substring ''tomorrow'',
+  so questions naming a specific weekday ("What''s the weather like Friday?") silently fell back to today''s forecast. Fixed by matching each forecast day''s actual weekday name against the question text before falling back to the ''tomorrow'' check.'
+triggers:
+- trigger: state
+  entity_id: assist_satellite.esp32_s3_box_3_a8afdc_assist_satellite
+  to: responding
+  id: lr_responding
+- trigger: state
+  entity_id: assist_satellite.esp32_s3_box_3_a8d314_assist_satellite
+  to: responding
+  id: kt_responding
+conditions: []
+actions:
+- action: weather.get_forecasts
+  target:
+    entity_id: weather.forecast_home
+  data:
+    type: daily
+  response_variable: forecast_result
+- variables:
+    icon_index_map:
+      sunny: 0
+      clear-night: 1
+      partlycloudy: 2
+      windy-variant: 3
+      cloudy: 4
+      pouring: 5
+      rainy: 6
+      lightning: 7
+      lightning-rainy: 7
+      hail: 8
+      snowy: 8
+      snowy-rainy: 8
+      fog: 9
+      exceptional: 9
+      windy: 9
+    condition_text_map:
+      sunny: Sunny
+      clear-night: Clear
+      partlycloudy: Partly Cloudy
+      windy-variant: Breezy
+      cloudy: Cloudy
+      pouring: Heavy Rain
+      rainy: Rain
+      lightning: Thunderstorms
+      lightning-rainy: Thunderstorms
+      hail: Hail
+      snowy: Snow
+      snowy-rainy: Snow
+      fog: Fog
+      exceptional: Severe
+      windy: Windy
+    forecast_items: '{{ forecast_result[''weather.forecast_home''].forecast }}'
+    weather_keyword_pattern: weather|forecast|temperature|degrees?|rain|raining|rainy|snow|snowing|sunny|cloud|cloudy|cold|hot|warm|wind|windy|humid|storm|umbrella|jacket
+- choose:
+  - conditions:
+    - condition: trigger
+      id: lr_responding
+    - condition: template
+      value_template: '{{ (states(''sensor.living_room_esp32_s3_box_3_living_room_last_question_full'') | default('''') | lower) is search(weather_keyword_pattern) }}'
+    sequence:
+    - variables:
+        question: '{{ states(''sensor.living_room_esp32_s3_box_3_living_room_last_question_full'') | default('''') | lower }}'
+        day_index_raw: '{% set ns = namespace(found=-1) %}{% for f in forecast_items %}{% if ns.found == -1 and (as_datetime(f.datetime) | as_local).strftime(''%A'') | lower in question %}{% set ns.found = loop.index0 %}{% endif %}{% endfor %}{% if ns.found != -1 %}{{ ns.found }}{% elif ''tomorrow'' in question %}1{% else %}0{% endif %}'
+        day_index: '{{ day_index_raw | trim | int(0) }}'
+    - variables:
+        day_item: '{{ forecast_items[day_index] if (forecast_items | length) > day_index else forecast_items[0] }}'
+    - variables:
+        icon_index: '{{ icon_index_map.get(day_item.condition, 0) | int }}'
+        condition_text: '{{ condition_text_map.get(day_item.condition, day_item.condition) }}'
+        temp_text: '{{ day_item.temperature | round(0) | int }}{{ state_attr(''weather.forecast_home'', ''temperature_unit'') }}'
+    - action: esphome.esp32_s3_box_3_a8afdc_show_weather
+      data:
+        icon_index: '{{ icon_index }}'
+        temp_text: '{{ temp_text }}'
+        condition_text: '{{ condition_text }}'
+        duration_s: 20
+  - conditions:
+    - condition: trigger
+      id: kt_responding
+    - condition: template
+      value_template: '{{ (states(''sensor.kitchen_kitchen_last_question_full'') | default('''') | lower) is search(weather_keyword_pattern) }}'
+    sequence:
+    - variables:
+        question: '{{ states(''sensor.kitchen_kitchen_last_question_full'') | default('''') | lower }}'
+        day_index_raw: '{% set ns = namespace(found=-1) %}{% for f in forecast_items %}{% if ns.found == -1 and (as_datetime(f.datetime) | as_local).strftime(''%A'') | lower in question %}{% set ns.found = loop.index0 %}{% endif %}{% endfor %}{% if ns.found != -1 %}{{ ns.found }}{% elif ''tomorrow'' in question %}1{% else %}0{% endif %}'
+        day_index: '{{ day_index_raw | trim | int(0) }}'
+    - variables:
+        day_item: '{{ forecast_items[day_index] if (forecast_items | length) > day_index else forecast_items[0] }}'
+    - variables:
+        icon_index: '{{ icon_index_map.get(day_item.condition, 0) | int }}'
+        condition_text: '{{ condition_text_map.get(day_item.condition, day_item.condition) }}'
+        temp_text: '{{ day_item.temperature | round(0) | int }}{{ state_attr(''weather.forecast_home'', ''temperature_unit'') }}'
+    - action: esphome.esp32_s3_box_3_a8d314_show_weather
+      data:
+        icon_index: '{{ icon_index }}'
+        temp_text: '{{ temp_text }}'
+        condition_text: '{{ condition_text }}'
+        duration_s: 20
+mode: queued
+max: 10
