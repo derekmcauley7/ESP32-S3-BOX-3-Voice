@@ -1,0 +1,1547 @@
+# =============================================================================
+#  reTerminal Sticky - Home Assistant wall controller
+#  Automation Addict  |  v22
+#
+#      +------------+------------+
+#      |   TILE 1   |   TILE 2   |
+#      +------------+------------+
+#      |   TILE 3   |   TILE 4   |
+#      +------------+------------+
+#      |      TAP TO TALK        |
+#      +-------------------------+
+#
+#  EVERYTHING YOU NEED TO CHANGE IS IN THE BLOCK DIRECTLY BELOW.
+#  Nothing under `# ---- machinery ----` needs touching to re-skin this for
+#  your own house.
+#
+#  Tiles 1-3 toggle anything toggleable - light, switch, fan, input_boolean,
+#  media_player, script. Tile 4 is the cover slot (blinds, curtains, garage).
+#  Want a fourth toggle instead of a cover? See SWAP-GUIDE.md.
+#
+#  Icons are Material Design Icon NAMES. Browse them at
+#  https://pictogrammers.com/library/mdi/ and paste the name in - no
+#  codepoints, no downloads, ESPHome fetches the SVG when it builds.
+# =============================================================================
+#
+#  ---------------------------------------------------------------------------
+#  BEFORE YOUR FIRST BUILD - secrets
+#  ---------------------------------------------------------------------------
+#  This file ships with NO credentials in it. Everything sensitive lives in
+#  `secrets.yaml`, which sits next to this file in your ESPHome config folder
+#  and never gets shared.
+#
+#  1. Generate an API encryption key. Easiest route is the ESPHome dashboard
+#     (it offers to make one when you add a device), or run:
+#         python3 -c "import os,base64;print(base64.b64encode(os.urandom(32)).decode())"
+#     Paste the result into the `api_encryption_key` line below.
+#
+#  2. Create `secrets.yaml` with these four lines:
+#
+#         wifi_ssid: "YourNetworkName"
+#         wifi_password: "YourWiFiPassword"
+#         ota_password: "something-long-and-random"
+#         api_encryption_key: "paste-the-44-character-key-here"
+#
+#  3. Add `secrets.yaml` to your `.gitignore` before you commit anything.
+#
+#  Note: OTA has its own password here rather than reusing the Wi-Fi one.
+#  They are separate credentials and should stay that way.
+#  ---------------------------------------------------------------------------
+substitutions:
+  # ---------------------------------------------------------------------------
+  #  >>>>>>>>>>>>>>>>>>>>>>  EDIT FROM HERE  <<<<<<<<<<<<<<<<<<<<<<
+  # ---------------------------------------------------------------------------
+  device_name: sticky-living-room
+  friendly_name: "Sticky Living Room"
+  footer_text: "living room"
+  # ---- TILE 1 (top left) ----------------------------------------------------
+  tile1_entity: light.living_room_main_light
+  tile1_label:  "Main Light"
+  tile1_icon:   ceiling-light
+  # ---- TILE 2 (top right) ---------------------------------------------------
+  tile2_entity: light.cinema_mode
+  tile2_label:  "Cinema"
+  tile2_icon:   lightbulb-group
+  # ---- TILE 3 (bottom left) -------------------------------------------------
+  tile3_entity: switch.christmas_lights
+  tile3_label:  "TV"
+  tile3_icon:   television
+  # ---- TILE 4 (bottom right) - THE COVER SLOT -------------------------------
+  #  Must be a `cover.` entity. Tapping it opens or closes, whichever is the
+  #  opposite of where it is now.
+  tile4_entity: cover.living_room_blinds
+  tile4_label:  "Blinds"
+  tile4_icon:   blinds
+  # ---- BOTTOM ROW: TALK and NOTE --------------------------------------------
+  voice_label: "JARVIS"
+  voice_icon:  home-assistant
+  #  The note is stored in Home Assistant, not on the device. Create a helper:
+  #    Settings > Devices & Services > Helpers > Create helper > Text
+  #    Name it "Sticky Note", set Maximum length to 255.
+  #  Storing it in HA rather than on the device means it survives deep sleep
+  #  AND you can set or clear the note from your phone while you are out.
+  note_entity:  input_text.sticky_note
+  note_label:   "NOTE"
+  note_icon:    note-edit-outline
+  #  Cosmetics for the note card.
+  #  The little icon above the greeting, top-left of the card.
+  note_accent_icon:  clippy
+  note_greeting:     "Meow,"
+  #  The big doodle in the bottom-right corner of the card.
+  note_doodle_icon:  cat
+  # ---- LOW POWER MODE -------------------------------------------------------
+  #  "true"  - sleeps after the idle timeout below, wakes on any button press.
+  #            Days of battery, but while asleep it cannot hear Home
+  #            Assistant, so the tiles show the last known states until
+  #            something wakes it.
+  #  "false" - never sleeps. Instantly responsive and always live, but you
+  #            will be charging it roughly daily.
+  #
+  #  Compile-time on purpose. This used to be a switch in Home Assistant, and
+  #  a stored "off" silently overrode the config - which is a miserable thing
+  #  to debug, because the file says one thing and the device does another.
+  #  Now the file is the only answer. Changing it means a reflash; knowing
+  #  what your device will do means reading one line.
+  low_power: "true"
+  awake_after_button_ms: "300000"    # 5 min awake after you touch it
+  awake_after_timer_ms:  "25000"     # 25 s awake on a self-triggered refresh
+  sleep_duration: 60min              # how often it wakes itself to catch up
+  # ---------------------------------------------------------------------------
+  #  >>>>>>>>>>>>>>>>>>>>>>  EDIT TO HERE  <<<<<<<<<<<<<<<<<<<<<<
+  #  Everything past this point is machinery.
+  # ---------------------------------------------------------------------------
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    # -------------------------------------------------------------------------
+    # PRIORITY 1000 - runs before ANY component sets up, display included
+    # (the display initialises at HARDWARE priority, 800).
+    #
+    # Why this exists: ESPHome puts the SSD1677 controller into its OWN deep
+    # sleep mode after each refresh, and the datasheet is clear that the only
+    # way out of that state is a HARDWARE reset. On an MCU deep-sleep wake the
+    # panel was never power-cycled - it is still sitting in controller deep
+    # sleep - so ESPHome's init sequence talks to a chip that is not listening.
+    # The result is a frame with inverted polarity and horizontal streaks,
+    # because the waveform LUT never loaded.
+    #
+    # So we cold-start the panel by hand here: drop its enable rail, hold
+    # reset low, let the rails collapse, then bring it back. By the time the
+    # display component initialises it is talking to a genuinely fresh
+    # controller.
+    #
+    # Pin numbers come from ESPHome's own board preset for this model:
+    #   enable 47   reset 17   cs 15   dc 16   busy 18
+    # -------------------------------------------------------------------------
+    - priority: 1000
+      then:
+        - lambda: |-
+            // 1. Release anything the deep-sleep pad hold was pinning.
+            gpio_deep_sleep_hold_dis();
+            gpio_hold_dis((gpio_num_t) 45);
+            gpio_hold_dis((gpio_num_t) 46);
+            // 2. Hard power-cycle the ePaper panel.
+            const gpio_num_t EPD_EN  = (gpio_num_t) 47;
+            const gpio_num_t EPD_RST = (gpio_num_t) 17;
+            gpio_hold_dis(EPD_EN);
+            gpio_hold_dis(EPD_RST);
+            gpio_reset_pin(EPD_EN);
+            gpio_reset_pin(EPD_RST);
+            gpio_set_direction(EPD_EN,  GPIO_MODE_OUTPUT);
+            gpio_set_direction(EPD_RST, GPIO_MODE_OUTPUT);
+            gpio_set_level(EPD_RST, 0);      // hold controller in reset
+            gpio_set_level(EPD_EN,  0);      // and kill its supply
+            delay(150);                      // let the rails actually collapse
+            gpio_set_level(EPD_EN,  1);      // power back up
+            delay(30);
+            gpio_set_level(EPD_RST, 1);      // release reset
+            delay(30);
+            ESP_LOGI("epd", "panel cold-started");
+    - priority: 600
+      then:
+        - lambda: |-
+            // A button wake means a person is here - stay up for the full
+            // idle window. A timed wake is just a refresh, so get in and out.
+            auto cause = esp_sleep_get_wakeup_cause();
+            bool by_button = (cause == ESP_SLEEP_WAKEUP_EXT1);
+            id(awake_ms) = by_button ? ${awake_after_button_ms} : ${awake_after_timer_ms};
+            id(note_sleep_card) = false;
+            ESP_LOGI("sleep", "wake cause=%d  awake_for=%d ms", (int) cause, id(awake_ms));
+        - deep_sleep.prevent: sleeper
+        - output.turn_on: pwr_hold
+        - output.turn_on: pwr_lock
+        - switch.turn_on: touch_power_enable
+        - output.turn_on: mic_power_enable
+        - output.turn_on: charge_enable
+        - pcf8563.read_time:
+    - priority: -100
+      then:
+        - delay: 4s
+        # Two full refreshes on wake. ePaper needs one pass to flush whatever
+        # the controller was left holding and a second to lay down a clean
+        # frame - cheap insurance against a half-initialised panel, and it
+        # costs a couple of seconds only on wake, not during normal use.
+        # Two refreshes, spaced well past a full cycle. The old version had
+        # them 1.5 s apart, so the second and third were simply rejected -
+        # "Display already in state POWER_OFF" in your log was exactly that.
+        - component.update: eink
+        - delay: 10s
+        - component.update: eink
+        - script.execute: idle_timer
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: ESP32S3
+  flash_size: 32MB
+  framework:
+    type: arduino
+    advanced:
+      enable_idf_experimental_features: true
+logger:
+  hardware_uart: UART0
+  level: INFO
+api:
+  encryption:
+    # Generate your own - see the "BEFORE YOUR FIRST BUILD" note at the top.
+    key: !secret api_encryption_key
+ota:
+  - platform: esphome
+    password: !secret ota_password
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  fast_connect: true
+  power_save_mode: LIGHT
+  ap:
+    ssid: "${device_name} Setup"
+captive_portal:
+spi:
+  clk_pin: GPIO13
+  mosi_pin: GPIO14
+  miso_pin: GPIO12
+i2c:
+  - id: i2c_sensor
+    scl: GPIO0
+    sda: GPIO1
+    frequency: 400kHz
+    # Boot log prints "Found i2c device at address 0x.." for each chip.
+    # Expect 0x44 (SHT40), 0x51 (RTC), 0x55 (BQ27220), 0x6A (IMU).
+    # If 0x55 is absent, the fuel gauge is not answering and no amount of
+    # register fiddling will help.
+    scan: true
+  - id: i2c_touch
+    scl: GPIO2
+    sda: GPIO3
+    frequency: 100kHz
+i2s_audio:
+  i2s_lrclk_pin: GPIO19
+# =============================================================================
+#  DEEP SLEEP
+#
+#  Wakes on ANY of the three physical buttons (OK/UP/DOWN), and once an hour on
+#  its own to refresh the clock and entity states. Sleeps again after the idle
+#  timer expires.
+#
+#  READ THIS BEFORE FLASHING - the one way this bites:
+#  GPIO45 and GPIO46 are the power latch. In deep sleep, ordinary GPIOs stop
+#  driving, the latch opens, and the device powers all the way off instead of
+#  sleeping. `gpio_deep_sleep_hold_en()` in the go_to_sleep script pins them
+#  where they are. If that ever fails you have not bricked anything - OK is the
+#  physical power button, so a long press brings it back.
+# =============================================================================
+deep_sleep:
+  id: sleeper
+  esp32_ext1_wakeup:
+    pins:
+      - number: GPIO4
+        mode: INPUT_PULLUP
+        allow_other_uses: true
+      - number: GPIO5
+        mode: INPUT_PULLUP
+        allow_other_uses: true
+      - number: GPIO6
+        mode: INPUT_PULLUP
+        allow_other_uses: true
+    mode: ANY_LOW
+  sleep_duration: ${sleep_duration}
+output:
+  - platform: gpio
+    pin: GPIO45
+    id: pwr_hold
+  - platform: gpio
+    pin: GPIO46
+    id: pwr_lock
+  - platform: gpio
+    pin: GPIO38
+    id: mic_power_enable
+  # BQ25616 charger enable, active LOW. This was missing - without driving it
+  # the charge path is left to whatever the pin defaults to. Turning this
+  # output ON drives the pin LOW, which enables charging.
+  - platform: gpio
+    pin:
+      number: GPIO39
+      inverted: true
+    id: charge_enable
+  - platform: ledc
+    pin: GPIO48
+    id: buzzer_pwm
+    frequency: 2700Hz
+switch:
+  # ---------------------------------------------------------------------------
+  # Touch axis correction, adjustable at runtime from Home Assistant.
+  # These stay switches on purpose: calibration is something you fiddle with
+  # once, and toggling beats a reflash-and-guess cycle. Unlike a power mode,
+  # getting one wrong is instantly obvious - the wrong tile fires.
+  # ---------------------------------------------------------------------------
+  - platform: template
+    id: flip_x
+    name: "Touch Flip X"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    entity_category: config
+  - platform: template
+    id: flip_y
+    name: "Touch Flip Y"
+    optimistic: true
+    # SETTLED: this board needs Y flipped and X left alone.
+    restore_mode: RESTORE_DEFAULT_ON
+    entity_category: config
+  - platform: gpio
+    pin: GPIO42
+    id: touch_power_enable
+    internal: true
+    restore_mode: ALWAYS_ON
+    setup_priority: 1100
+light:
+  - platform: monochromatic
+    output: buzzer_pwm
+    id: buzzer
+    internal: true
+    default_transition_length: 0s
+time:
+  - platform: pcf8563
+    i2c_id: i2c_sensor
+    id: rtc_time
+    address: 0x51
+    update_interval: never
+  - platform: homeassistant
+    id: ha_time
+    on_time_sync:
+      then:
+        - pcf8563.write_time:
+# ui_mode: 0 menu, 1 listening, 2 thinking, 3 reply
+globals:
+  - id: ui_mode
+    type: int
+    restore_value: false
+    initial_value: '0'
+  - id: awake_ms
+    type: int
+    restore_value: false
+    initial_value: '${awake_after_button_ms}'
+  - id: hit_tile
+    type: int
+    restore_value: false
+    initial_value: '-1'
+  # True while a voice session is capturing a NOTE rather than a command.
+  - id: note_capture
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  # True when the note card is being drawn as the sleep screen, so we leave
+  # the buttons off it - nothing can be pressed while it is asleep.
+  - id: sleep_redraw
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: note_sleep_card
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: last_heard
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+  - id: last_reply
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+font:
+  - file: "gfonts://Inter@700"
+    id: f_tile
+    size: 27
+  - file: "gfonts://Inter@700"
+    id: f_state
+    size: 21
+  - file: "gfonts://Inter@700"
+    id: f_head
+    size: 36
+  - file: "gfonts://Inter@400"
+    id: f_body
+    size: 24
+  # Three sizes for the note. Short notes get the big one; the lambda steps
+  # down only if the text will not fit.
+  - file: "gfonts://Inter@600"
+    id: f_note_xl
+    size: 50
+  - file: "gfonts://Inter@600"
+    id: f_note_lg
+    size: 40
+  - file: "gfonts://Inter@500"
+    id: f_reply
+    size: 31
+  - file: "gfonts://Inter@400"
+    id: f_small
+    size: 17
+# BINARY + chroma_key transparency = only the glyph pixels are drawn, no
+# background box. (TRANSPARENT_BINARY was the old spelling; ESPHome removed it.)
+image:
+  - id: ic_tile1
+    file: mdi:${tile1_icon}
+    resize: 96x96
+    type: BINARY
+    transparency: chroma_key
+  - id: ic_tile2
+    file: mdi:${tile2_icon}
+    resize: 96x96
+    type: BINARY
+    transparency: chroma_key
+  - id: ic_tile3
+    file: mdi:${tile3_icon}
+    resize: 96x96
+    type: BINARY
+    transparency: chroma_key
+  - id: ic_tile4
+    file: mdi:${tile4_icon}
+    resize: 96x96
+    type: BINARY
+    transparency: chroma_key
+  - id: ic_mic
+    file: mdi:${voice_icon}
+    resize: 64x64
+    type: BINARY
+    transparency: chroma_key
+  - id: ic_listening
+    file: mdi:microphone-message
+    resize: 160x160
+    type: BINARY
+    transparency: chroma_key
+  - id: ic_thinking
+    file: mdi:dots-horizontal-circle-outline
+    resize: 160x160
+    type: BINARY
+    transparency: chroma_key
+  - id: ic_back
+    file: mdi:arrow-left
+    resize: 40x40
+    type: BINARY
+    transparency: chroma_key
+  - id: ic_note
+    file: mdi:${note_icon}
+    resize: 64x64
+    type: BINARY
+    transparency: chroma_key
+  - id: ic_accent
+    file: mdi:${note_accent_icon}
+    resize: 34x34
+    type: BINARY
+    transparency: chroma_key
+  - id: ic_doodle
+    file: mdi:${note_doodle_icon}
+    resize: 120x120
+    type: BINARY
+    transparency: chroma_key
+  - id: ic_trash
+    file: mdi:trash-can-outline
+    resize: 40x40
+    type: BINARY
+    transparency: chroma_key
+  - id: ic_reply
+    file: mdi:message-text-outline
+    resize: 88x88
+    type: BINARY
+    transparency: chroma_key
+sensor:
+  - platform: sht4x
+    i2c_id: i2c_sensor
+    address: 0x44
+    temperature:
+      name: "Temperature"
+      id: temp_sensor
+    humidity:
+      name: "Humidity"
+      id: hum_sensor
+    update_interval: 120s
+  - platform: template
+    id: battery_level
+    name: "Battery Level"
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 120s
+    lambda: |-
+      // BQ27220 StateOfCharge, standard command 0x2C. No unseal needed.
+      uint8_t reg = 0x2C;
+      uint8_t raw[2] = {0, 0};
+      auto err = id(i2c_sensor).write_readv(0x55, &reg, 1, raw, 2);
+      if (err != esphome::i2c::ERROR_OK) {
+        ESP_LOGW("battery", "BQ27220 SoC read failed, i2c error=%d", (int) err);
+        return NAN;
+      }
+      return static_cast<float>(static_cast<uint16_t>(raw[0]) |
+                               (static_cast<uint16_t>(raw[1]) << 8));
+  # Voltage and current are the diagnostic pair. If these read fine but SoC
+  # does not, it is a register problem. If all three fail, the gauge is not on
+  # the bus at all - check the scan lines in the boot log.
+  - platform: template
+    id: battery_voltage
+    name: "Battery Voltage"
+    unit_of_measurement: "mV"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 120s
+    lambda: |-
+      uint8_t reg = 0x08;                      // Voltage()
+      uint8_t raw[2] = {0, 0};
+      auto err = id(i2c_sensor).write_readv(0x55, &reg, 1, raw, 2);
+      if (err != esphome::i2c::ERROR_OK) return NAN;
+      return static_cast<float>(static_cast<uint16_t>(raw[0]) |
+                               (static_cast<uint16_t>(raw[1]) << 8));
+  - platform: template
+    id: battery_current
+    name: "Battery Current"
+    unit_of_measurement: "mA"
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 120s
+    lambda: |-
+      uint8_t reg = 0x0C;                      // AverageCurrent(), signed
+      uint8_t raw[2] = {0, 0};
+      auto err = id(i2c_sensor).write_readv(0x55, &reg, 1, raw, 2);
+      if (err != esphome::i2c::ERROR_OK) return NAN;
+      uint16_t v = static_cast<uint16_t>(raw[0]) | (static_cast<uint16_t>(raw[1]) << 8);
+      return static_cast<float>(static_cast<int16_t>(v));   // positive = charging
+  - platform: wifi_signal
+    name: "Wi-Fi Signal"
+    update_interval: 120s
+    entity_category: diagnostic
+# -----------------------------------------------------------------------------
+# PDM microphone
+#
+# ESPHome's defaults here are wrong for a single PDM mic and produce exactly
+# what you saw: 15 seconds of listening, pure silence, and Whisper filling the
+# void with "Thank you."
+#
+#   channel          default is `right`. A single PDM mic with its SELECT pin
+#                    tied low sits on the LEFT channel - which is the usual
+#                    wiring. Reading the right channel gives you digital
+#                    silence, not quiet audio. THIS IS THE PRIME SUSPECT.
+#   bits_per_sample  default is `32bit`. PDM mics want 16.
+#   correct_dc_offset  PDM output averages off-zero; without this the signal
+#                    can sit hard against a rail and clip to nothing.
+#
+# If it is still silent after this, flip `channel` to `right` and rebuild -
+# that one line is the whole experiment.
+# -----------------------------------------------------------------------------
+microphone:
+  - platform: i2s_audio
+    id: onboard_mic
+    adc_type: external
+    pdm: true
+    i2s_din_pin: GPIO20
+    channel: left
+    bits_per_sample: 16bit
+    sample_rate: 16000
+    correct_dc_offset: true
+voice_assistant:
+  microphone: onboard_mic
+  use_wake_word: false
+  # Gain knobs. Only worth touching once the mic is producing SOMETHING -
+  # they cannot rescue digital silence. Uncomment one at a time; these have
+  # moved between ESPHome releases and may not validate.
+  # volume_multiplier: 2.0
+  # auto_gain: 31dBFS
+  # noise_suppression_level: 2
+  # NO redraw in on_listening - start_voice has already painted that screen.
+  # Refreshing here would block the loop while the mic is live, which is the
+  # whole problem we are avoiding.
+  on_listening:
+    - logger.log:
+        level: WARN
+        format: "VA listening"
+  # Capture the transcript but do NOT refresh yet. Audio has stopped by now,
+  # but the reply lands a second or two later and one refresh is better than
+  # two back to back.
+  on_stt_end:
+    - lambda: |-
+        id(last_heard) = x;
+    - logger.log:
+        level: WARN
+        format: "VA heard: '%s'"
+        args: ['x.c_str()']
+    - if:
+        condition:
+          lambda: 'return id(note_capture);'
+        then:
+          # A note, not a command. Stop the pipeline here so Home Assistant
+          # does not try to ACT on "lunch is on the desk", then store the text
+          # in the input_text helper and show the card.
+          - voice_assistant.stop:
+          - homeassistant.action:
+              action: input_text.set_value
+              data:
+                entity_id: ${note_entity}
+              data_template:
+                value: "{{ note }}"
+              variables:
+                note: !lambda 'return id(last_heard);'
+          - lambda: |-
+              id(note_capture) = false;
+              id(note_sleep_card) = false;
+              id(ui_mode) = 4;
+          - script.execute: redraw
+        else:
+          - lambda: 'id(ui_mode) = 2;'
+  on_tts_start:
+    - if:
+        condition:
+          lambda: 'return id(note_capture) || id(ui_mode) == 4;'
+        then:
+          - logger.log: "ignoring TTS - that was a note"
+        else:
+          - lambda: |-
+              id(last_reply) = x;
+              if (id(last_heard).empty()) id(last_heard) = "(nothing heard)";
+              id(ui_mode) = 3;
+    - script.execute: beep
+    - script.execute: redraw
+    - script.execute: back_to_menu
+  on_end:
+    - if:
+        condition:
+          lambda: 'return id(ui_mode) != 3 && id(ui_mode) != 4;'
+        then:
+          - lambda: |-
+              id(note_capture) = false;
+              id(ui_mode) = 0;
+          - script.execute: redraw
+  on_error:
+    - lambda: |-
+        id(last_reply) = std::string("Sorry - ") + message;
+        id(ui_mode) = 3;
+    - script.execute: redraw
+    - script.execute: back_to_menu
+touchscreen:
+  - platform: gt911
+    i2c_id: i2c_touch
+    id: sticky_touch
+    interrupt_pin: GPIO21
+    reset_pin: GPIO41
+    display: eink
+    # NO transform. Axis correction now happens in software below, via the
+    # "Touch Flip X" / "Touch Flip Y" switches in Home Assistant, so getting
+    # it wrong costs a toggle instead of a reflash.
+    on_touch:
+      - lambda: |-
+          int rx = touch.x, ry = touch.y;
+          int x = rx, y = ry;
+          if (id(flip_x).state) x = 479 - x;
+          if (id(flip_y).state) y = 799 - y;
+          // What a tap means depends on which screen is showing.
+          //   0-3 entity tiles   4 voice / cancel   5 back
+          int t = -1;
+          //   0-3 tiles  4 talk/cancel  5 back  6 note  7 clear  8 new note
+          if (id(ui_mode) == 0) {
+            if      (y >=  72 && y <= 294) t = (x < 240) ? 0 : 1;
+            else if (y >= 306 && y <= 528) t = (x < 240) ? 2 : 3;
+            else if (y >= 542 && y <= 722) t = (x < 240) ? 4 : 6;
+          } else if (id(ui_mode) == 1 || id(ui_mode) == 2) {
+            t = 4;                                  // anywhere cancels
+          } else if (id(ui_mode) == 3) {
+            if (x >= 12 && x <= 468 && y >= 660 && y <= 752) t = 5;
+          } else if (id(ui_mode) == 4) {
+            if (y >= 660 && y <= 752) {
+              if      (x <= 157) t = 5;      // BACK
+              else if (x >= 322) t = 7;      // CLEAR
+              else               t = 8;      // NEW
+            }
+          }
+          id(hit_tile) = t;
+          ESP_LOGD("touch", "raw=%d,%d  mapped=%d,%d  mode=%d  tile=%d",
+                   rx, ry, x, y, id(ui_mode), t);
+      - lambda: 'id(awake_ms) = ${awake_after_button_ms};'
+      - script.execute: idle_timer
+      # entity tiles
+      - if:
+          condition:
+            lambda: 'return id(ui_mode) == 0 && id(hit_tile) >= 0 && id(hit_tile) <= 3;'
+          then:
+            - script.execute:
+                id: do_toggle
+                idx: !lambda 'return id(hit_tile);'
+      # voice tile / cancel
+      - if:
+          condition:
+            lambda: 'return id(hit_tile) == 4;'
+          then:
+            - if:
+                condition:
+                  lambda: 'return id(ui_mode) == 0;'
+                then:
+                  - script.execute: start_voice
+                else:
+                  - script.execute: beep
+                  - voice_assistant.stop:
+                  - script.stop: back_to_menu
+                  - lambda: 'id(ui_mode) = 0;'
+                  - script.execute: redraw
+      # BACK
+      - if:
+          condition:
+            lambda: 'return id(hit_tile) == 5;'
+          then:
+            - script.execute: go_back
+      # NOTE tile. If a note already exists this OPENS it - so you can read it
+      # and clear it. Only dictates a new one when there is nothing there.
+      - if:
+          condition:
+            lambda: 'return id(hit_tile) == 6 && id(ui_mode) == 0;'
+          then:
+            - if:
+                condition:
+                  lambda: |-
+                    std::string n = id(st_note).state;
+                    return !n.empty() && n != "unknown" && n != "unavailable";
+                then:
+                  - script.execute: beep
+                  - lambda: |-
+                      id(note_sleep_card) = false;
+                      id(ui_mode) = 4;
+                  - script.execute: redraw
+                else:
+                  - script.execute: start_note
+      # NEW - re-dictate from the note card
+      - if:
+          condition:
+            lambda: 'return id(hit_tile) == 8;'
+          then:
+            - script.execute: start_note
+      # CLEAR the note
+      - if:
+          condition:
+            lambda: 'return id(hit_tile) == 7;'
+          then:
+            - script.execute: clear_note
+binary_sensor:
+  - platform: homeassistant
+    id: st_tile1
+    entity_id: ${tile1_entity}
+    on_state:
+      - script.execute: redraw
+  - platform: homeassistant
+    id: st_tile2
+    entity_id: ${tile2_entity}
+    on_state:
+      - script.execute: redraw
+  - platform: homeassistant
+    id: st_tile3
+    entity_id: ${tile3_entity}
+    on_state:
+      - script.execute: redraw
+  # ---- physical buttons ----
+  # Any of the three also wakes the panel from deep sleep.
+  # OK   = start a voice session, or dismiss a reply
+  # UP   = refresh the screen
+  # DOWN = refresh the screen
+  - platform: gpio
+    pin:
+      number: GPIO5
+      mode: INPUT_PULLUP
+      inverted: true
+      # also declared as a deep-sleep ext1 wake source
+      allow_other_uses: true
+    id: btn_up
+    name: "Button UP"
+    filters:
+      - delayed_on: 20ms
+    on_press:
+      - lambda: 'id(awake_ms) = ${awake_after_button_ms};'
+      - script.execute: idle_timer
+      - script.execute: beep
+      - script.execute: redraw
+  - platform: gpio
+    pin:
+      number: GPIO6
+      mode: INPUT_PULLUP
+      inverted: true
+      # also declared as a deep-sleep ext1 wake source
+      allow_other_uses: true
+    id: btn_down
+    name: "Button DOWN"
+    filters:
+      - delayed_on: 20ms
+    on_press:
+      - lambda: 'id(awake_ms) = ${awake_after_button_ms};'
+      - script.execute: idle_timer
+      - script.execute: beep
+      - script.execute: redraw
+  - platform: gpio
+    pin:
+      number: GPIO4
+      mode: INPUT_PULLUP
+      inverted: true
+      # also declared as a deep-sleep ext1 wake source
+      allow_other_uses: true
+    id: btn_ok
+    name: "Button OK"
+    filters:
+      - delayed_on: 20ms
+    on_press:
+      - lambda: 'id(awake_ms) = ${awake_after_button_ms};'
+      - script.execute: idle_timer
+      - if:
+          condition:
+            lambda: 'return id(ui_mode) == 0;'
+          then:
+            - script.execute: start_voice
+          else:
+            - if:
+                condition:
+                  lambda: 'return id(ui_mode) == 3;'
+                then:
+                  - script.execute: go_back
+                else:
+                  - script.execute: beep
+text_sensor:
+  # The note itself. Lives in Home Assistant so it survives deep sleep and can
+  # be set from a phone.
+  - platform: homeassistant
+    id: st_note
+    entity_id: ${note_entity}
+    on_value:
+      - script.execute: redraw
+  - platform: homeassistant
+    id: st_tile4
+    entity_id: ${tile4_entity}
+    on_value:
+      - script.execute: redraw
+script:
+  # ONE path to the screen. Every trigger calls this instead of
+  # component.update, and mode: restart collapses a burst of state changes
+  # into a single refresh. Without this, HA state arriving for four entities
+  # at once fires four overlapping refreshes and the driver throws
+  # "Display already in state POWER_OFF".
+  # A full refresh on this panel is ASYNCHRONOUS and takes SECONDS. ESPHome's
+  # `component.update` only kicks the state machine off; the work happens over
+  # many loop iterations while it waits on the busy pin. Calling update again
+  # before it reaches IDLE is rejected outright:
+  #     [E][epaper_spi]: Display already in state POWER_OFF
+  # ...and that frame is simply lost.
+  #
+  # So this is `queued`, not `restart`, with a tail delay that holds the queue
+  # until the panel has genuinely finished. Refreshes now serialise instead of
+  # trampling each other. max_runs caps a burst at two.
+  - id: redraw
+    mode: queued
+    max_runs: 2
+    then:
+      - delay: 900ms
+      - logger.log:
+          level: WARN
+          format: "REDRAW  t1=%d t2=%d t3=%d t4=%s"
+          args:
+            - id(st_tile1).state
+            - id(st_tile2).state
+            - id(st_tile3).state
+            - id(st_tile4).state.c_str()
+      - component.update: eink
+      # Hold the queue open until the refresh is actually done.
+      - delay: 6s
+  # ---------------------------------------------------------------------------
+  # Draw the listening screen BEFORE the microphone opens.
+  #
+  # A full ePaper refresh blocks the main loop for well over a second. If the
+  # voice pipeline is already streaming when that happens, the I2S buffer is
+  # not serviced and the audio arrives at Home Assistant full of holes - or
+  # as near-silence. Whisper's response to near-silence is to hallucinate a
+  # common phrase, which is why you got "thank you" instead of what you said.
+  #
+  # So: cancel any pending redraw, paint the listening screen, let the panel
+  # settle, and only then start the mic. Costs ~2 s before it listens, but
+  # the audio is clean.
+  # ---------------------------------------------------------------------------
+  - id: start_voice
+    mode: single
+    then:
+      # 1. Soft low pip immediately, so the tap does not feel dead.
+      - output.ledc.set_frequency:
+          id: buzzer_pwm
+          frequency: 1800Hz
+      - light.turn_on:
+          id: buzzer
+          brightness: 45%
+      - delay: 35ms
+      - light.turn_off: buzzer
+      # 2. Paint the listening screen and wait for it to finish.
+      - script.stop: redraw
+      - lambda: |-
+          id(ui_mode) = 1;
+          id(last_heard) = "";
+          id(last_reply) = "";
+      - component.update: eink
+      - delay: 250ms
+      # 3. Two high pips = "speak now". These run inline rather than as a
+      #    separate script so they are guaranteed to FINISH before the mic
+      #    opens - otherwise the buzzer is the first thing Whisper hears.
+      - output.ledc.set_frequency:
+          id: buzzer_pwm
+          frequency: 3200Hz
+      - light.turn_on:
+          id: buzzer
+          brightness: 70%
+      - delay: 55ms
+      - light.turn_off: buzzer
+      - delay: 55ms
+      - light.turn_on:
+          id: buzzer
+          brightness: 70%
+      - delay: 55ms
+      - light.turn_off: buzzer
+      - output.ledc.set_frequency:
+          id: buzzer_pwm
+          frequency: 2700Hz
+      # 4. Let the buzzer stop ringing, then open the mic.
+      - delay: 150ms
+      - voice_assistant.start:
+  # ---------------------------------------------------------------------------
+  # Dictate a note. Same pre-roll as start_voice - screen first, then pips,
+  # then the mic - but flagged so the transcript is kept as a note instead of
+  # being run as a command.
+  # ---------------------------------------------------------------------------
+  - id: start_note
+    mode: single
+    then:
+      - lambda: 'id(note_capture) = true;'
+      - output.ledc.set_frequency:
+          id: buzzer_pwm
+          frequency: 1800Hz
+      - light.turn_on:
+          id: buzzer
+          brightness: 45%
+      - delay: 35ms
+      - light.turn_off: buzzer
+      - script.stop: redraw
+      - lambda: |-
+          id(ui_mode) = 1;
+          id(last_heard) = "";
+          id(last_reply) = "";
+      - component.update: eink
+      - delay: 250ms
+      - output.ledc.set_frequency:
+          id: buzzer_pwm
+          frequency: 3200Hz
+      - light.turn_on:
+          id: buzzer
+          brightness: 70%
+      - delay: 55ms
+      - light.turn_off: buzzer
+      - delay: 55ms
+      - light.turn_on:
+          id: buzzer
+          brightness: 70%
+      - delay: 55ms
+      - light.turn_off: buzzer
+      - output.ledc.set_frequency:
+          id: buzzer_pwm
+          frequency: 2700Hz
+      - delay: 150ms
+      - voice_assistant.start:
+  - id: clear_note
+    mode: single
+    then:
+      - script.execute: beep
+      - homeassistant.action:
+          action: input_text.set_value
+          data:
+            entity_id: ${note_entity}
+            value: ""
+      - lambda: |-
+          id(ui_mode) = 0;
+          id(note_sleep_card) = false;
+      - script.execute: redraw
+  # Restarted by every interaction. When it finally runs out, we sleep.
+  # mode: restart - so ANY interaction pushes sleep back by the full window.
+  # If the panel never sleeps, this log is where to look: a line every few
+  # seconds means something keeps restarting the countdown (a stray touch,
+  # usually), rather than the sleep code being broken.
+  - id: idle_timer
+    mode: restart
+    then:
+      - logger.log:
+          level: WARN
+          format: "idle timer armed for %d ms"
+          args: ['id(awake_ms)']
+      - delay: !lambda 'return id(awake_ms);'
+      - logger.log:
+          level: WARN
+          format: "idle timer expired - trying to sleep"
+      - script.execute: go_to_sleep
+  - id: go_to_sleep
+    mode: single
+    then:
+      # Compile-time flag, so this whole branch folds away to nothing when
+      # low_power is "true".
+      - if:
+          condition:
+            lambda: 'return std::string("${low_power}") != "true";'
+          then:
+            - logger.log:
+                level: WARN
+                format: "NOT SLEEPING - low_power is set to false in the config"
+          else:
+            # ---------------------------------------------------------------
+            # THIS is what was corrupting the screen.
+            #
+            # The old version fired a refresh, waited 300 ms, then entered
+            # deep sleep. But a full refresh takes SECONDS - so the MCU was
+            # cutting power to the panel roughly a tenth of the way through
+            # its waveform. What you were left looking at was a half-written
+            # frame: inverted polarity, horizontal banding. Not a wake bug at
+            # all - the damage was done on the way DOWN.
+            #
+            # Two changes. Only refresh if the screen is not already showing
+            # the menu, and then wait long enough for the panel to finish.
+            # ---------------------------------------------------------------
+            # If a note is set, that is what the panel should be showing while
+            # it sleeps - ePaper holds the image with no power, so the note
+            # stays readable on the wall for days.
+            - lambda: |-
+                std::string n = id(st_note).state;
+                bool have_note = !n.empty() && n != "unknown" && n != "unavailable";
+                int target = have_note ? 4 : 0;
+                id(sleep_redraw)    = (id(ui_mode) != target) || have_note;
+                id(note_sleep_card) = have_note;
+                id(ui_mode)         = target;
+            - if:
+                condition:
+                  lambda: 'return id(sleep_redraw);'
+                then:
+                  - script.stop: redraw
+                  - component.update: eink
+                  - logger.log:
+                      level: WARN
+                      format: "waiting for panel before sleep"
+                  - delay: 10s
+            # Drop the rails we do not need held.
+            - output.turn_off: mic_power_enable
+            - switch.turn_off: touch_power_enable
+            - logger.log:
+                level: WARN
+                format: "sleeping"
+            - delay: 200ms
+            # Pin GPIO45/46 (the power latch) so the device sleeps rather
+            # than switching itself off. Per-pin hold FIRST, so that
+            # gpio_deep_sleep_hold_en() latches only these two rather than
+            # freezing every pad on the chip - the display's pins in
+            # particular need to stay free.
+            - lambda: |-
+                gpio_hold_en((gpio_num_t) 45);
+                gpio_hold_en((gpio_num_t) 46);
+                gpio_deep_sleep_hold_en();
+            # on_boot calls deep_sleep.prevent so the device does not sleep
+            # the instant it starts up. `deep_sleep.enter` is a manual entry
+            # and bypasses that flag - but clearing it explicitly first costs
+            # nothing and removes any doubt.
+            - deep_sleep.allow: sleeper
+            - deep_sleep.enter: sleeper
+  - id: late_redraw
+    mode: restart
+    then:
+      - delay: 15s
+      - script.execute: redraw
+  - id: beep
+    mode: restart
+    then:
+      - light.turn_on:
+          id: buzzer
+          brightness: 60%
+      - delay: 40ms
+      - light.turn_off: buzzer
+  # Explicit dismiss - the BACK button and the OK key both land here.
+  - id: go_back
+    mode: single
+    then:
+      - script.execute: beep
+      - script.stop: back_to_menu
+      - lambda: |-
+          id(ui_mode) = 0;
+          id(last_heard) = "";
+          id(last_reply) = "";
+      - script.execute: redraw
+  # Safety net only. You dismiss the reply yourself now, but a wall panel
+  # should not sit on a stale answer indefinitely if nobody comes back to it.
+  - id: back_to_menu
+    mode: restart
+    then:
+      - delay: 3min
+      - lambda: |-
+          id(ui_mode) = 0;
+          id(last_heard) = "";
+          id(last_reply) = "";
+      - script.execute: redraw
+  - id: do_toggle
+    mode: single
+    parameters:
+      idx: int
+    then:
+      - script.execute: beep
+      # `homeassistant.toggle` is domain-agnostic - it works on lights,
+      # switches, fans, input_booleans and media_players alike. That is why
+      # pointing a tile at a different KIND of entity needs no change here,
+      # only the entity id at the top of the file.
+      - if:
+          condition:
+            lambda: 'return idx == 0;'
+          then:
+            - homeassistant.action:
+                action: homeassistant.toggle
+                data:
+                  entity_id: ${tile1_entity}
+      - if:
+          condition:
+            lambda: 'return idx == 1;'
+          then:
+            - homeassistant.action:
+                action: homeassistant.toggle
+                data:
+                  entity_id: ${tile2_entity}
+      - if:
+          condition:
+            lambda: 'return idx == 2;'
+          then:
+            - homeassistant.action:
+                action: homeassistant.toggle
+                data:
+                  entity_id: ${tile3_entity}
+      - if:
+          condition:
+            lambda: 'return idx == 3 && (id(st_tile4).state == "open" || id(st_tile4).state == "opening");'
+          then:
+            - homeassistant.action:
+                action: cover.close_cover
+                data:
+                  entity_id: ${tile4_entity}
+      - if:
+          condition:
+            lambda: 'return idx == 3 && id(st_tile4).state != "open" && id(st_tile4).state != "opening";'
+          then:
+            - homeassistant.action:
+                action: cover.open_cover
+                data:
+                  entity_id: ${tile4_entity}
+      # No refresh here on purpose. The incoming HA state change fires the
+      # redraw by itself - the log shows it landing ~1.5 s after each tap.
+      # The extra "insurance" refresh was arriving while the panel was still
+      # mid-cycle, which is exactly what produced the
+      # "Display already in state POWER_OFF" errors.
+      # Covers take ~13 s to finish travelling, so catch the settled state.
+      - if:
+          condition:
+            lambda: 'return idx == 3;'
+          then:
+            - script.execute: late_redraw
+display:
+  - platform: epaper_spi
+    id: eink
+    model: seeed-reterminal-sticky
+    rotation: 90
+    # NO full_update_every. Partial refresh on this panel drops draw calls and
+    # smears the previous frame. Full refresh every time, always correct.
+    # never = the display does not schedule itself; the redraw script owns it.
+    update_interval: never
+    lambda: |-
+      // ---------------------------------------------------------------
+      // On this panel COLOR_OFF is the INK and COLOR_ON is the PAPER.
+      // Naming them removes any chance of getting it backwards again.
+      // ---------------------------------------------------------------
+      const Color INK   = COLOR_OFF;
+      const Color PAPER = COLOR_ON;
+      const int W = 480;
+      const int H = 800;
+      auto thick_box = [&](int x, int y, int w, int h, int t) {
+        for (int i = 0; i < t; i++) it.rectangle(x + i, y + i, w - 2*i, h - 2*i, INK);
+      };
+      // A deliberately imperfect rectangle. Straight lines look printed;
+      // a bit of jitter reads as handwritten, which is the whole point of a
+      // note left on the fridge.
+      auto wobbly_box = [&](int x0, int y0, int x1, int y1) {
+        const int j[10] = {0, 2, -1, 1, -2, 1, 0, -1, 2, -1};
+        int k = 0;
+        for (int x = x0; x < x1; x += 46) {
+          int xe = (x + 46 > x1) ? x1 : x + 46;
+          it.line(x, y0 + j[k % 10], xe, y0 + j[(k + 1) % 10], INK);
+          it.line(x, y1 + j[(k + 3) % 10], xe, y1 + j[(k + 4) % 10], INK);
+          k++;
+        }
+        k = 0;
+        for (int y = y0; y < y1; y += 46) {
+          int ye = (y + 46 > y1) ? y1 : y + 46;
+          it.line(x0 + j[k % 10], y, x0 + j[(k + 1) % 10], ye, INK);
+          it.line(x1 + j[(k + 5) % 10], y, x1 + j[(k + 6) % 10], ye, INK);
+          k++;
+        }
+      };
+      // Break a string into lines of at most `maxc` characters, on spaces.
+      auto wrap = [](std::string s, size_t maxc) {
+        std::vector<std::string> out;
+        while (!s.empty() && out.size() < 10) {
+          size_t cut = s.size();
+          if (s.size() > maxc) {
+            size_t sp = s.rfind(' ', maxc);
+            cut = (sp == std::string::npos || sp == 0) ? maxc : sp;
+          }
+          out.push_back(s.substr(0, cut));
+          s = (cut < s.size()) ? s.substr(cut) : std::string("");
+          while (!s.empty() && s[0] == ' ') s.erase(0, 1);
+        }
+        return out;
+      };
+      // ======================= HEADER =======================
+      auto now = id(rtc_time).now();
+      if (now.is_valid()) {
+        it.strftime(14, 10, id(f_body), INK, TextAlign::TOP_LEFT, "%a %H:%M", now);
+      }
+      // ---- battery gauge: outline, proportional fill, percentage ----
+      {
+        const int bx = W - 62, by = 13, bw = 44, bh = 22;
+        it.rectangle(bx, by, bw, bh, INK);                // body
+        it.filled_rectangle(bx + bw, by + 7, 4, 8, INK);  // terminal nub
+        float pct = id(battery_level).state;
+        if (!isnan(pct)) {
+          if (pct < 0) pct = 0;
+          if (pct > 100) pct = 100;
+          int fill = (int) ((bw - 6) * pct / 100.0f);
+          if (fill > 0) it.filled_rectangle(bx + 3, by + 3, fill, bh - 6, INK);
+          it.printf(bx - 8, 10, id(f_body), INK, TextAlign::TOP_RIGHT, "%.0f%%", pct);
+        } else {
+          // Gauge not answering. Draw the empty outline anyway so the absence
+          // is visible rather than silently blank.
+          it.print(bx - 8, 10, id(f_body), INK, TextAlign::TOP_RIGHT, "--");
+        }
+        // Charging: a small bolt to the left of the readout.
+        if (!isnan(id(battery_current).state) && id(battery_current).state > 20.0f) {
+          int cx = bx - 78, cy = 13;
+          it.line(cx + 8, cy,      cx + 2, cy + 11, INK);
+          it.line(cx + 2, cy + 11, cx + 9, cy + 11, INK);
+          it.line(cx + 9, cy + 11, cx + 3, cy + 22, INK);
+        }
+      }
+      it.filled_rectangle(14, 48, W - 28, 2, INK);
+      // ======================== MENU ========================
+      if (id(ui_mode) == 0) {
+        const int TW = 222, TH = 222;
+        const int tx[4] = { 12, 246,  12, 246};
+        const int ty[4] = { 72,  72, 306, 306};
+        const char* names[4] = {"${tile1_label}", "${tile2_label}",
+                                "${tile3_label}", "${tile4_label}"};
+        bool on[4];
+        on[0] = id(st_tile1).state;
+        on[1] = id(st_tile2).state;
+        on[2] = id(st_tile3).state;
+        // A cover is not just open/closed - it spends ~13 s in opening/closing.
+        // Treating those as "not open" is what made a blinds press look like
+        // nothing had happened.
+        std::string bs = id(st_tile4).state;
+        on[3] = (bs == "open" || bs == "opening");
+        const char* states[4];
+        states[0] = on[0] ? "ON" : "OFF";
+        states[1] = on[1] ? "ON" : "OFF";
+        states[2] = on[2] ? "ON" : "OFF";
+        states[3] = (bs == "open")    ? "OPEN"
+                  : (bs == "closed")  ? "CLOSED"
+                  : (bs == "opening") ? "OPENING"
+                  : (bs == "closing") ? "CLOSING"
+                  : "--";
+        for (int i = 0; i < 4; i++) {
+          int x = tx[i], y = ty[i];
+          bool inv = on[i];
+          // ON  = solid ink tile, paper-coloured contents
+          // OFF = paper tile with a 3 px ink border, ink contents
+          Color fg = inv ? PAPER : INK;
+          Color bg = inv ? INK   : PAPER;
+          if (inv) {
+            it.filled_rectangle(x, y, TW, TH, INK);
+          } else {
+            thick_box(x, y, TW, TH, 3);
+          }
+          int ix = x + (TW - 96) / 2;
+          switch (i) {
+            case 0: it.image(ix, y + 20, id(ic_tile1), fg, bg); break;
+            case 1: it.image(ix, y + 20, id(ic_tile2), fg, bg); break;
+            case 2: it.image(ix, y + 20, id(ic_tile3), fg, bg); break;
+            case 3: it.image(ix, y + 20, id(ic_tile4), fg, bg); break;
+          }
+          it.printf(x + TW/2, y + 126, id(f_tile), fg, TextAlign::TOP_CENTER,
+                    "%s", names[i]);
+          it.printf(x + TW/2, y + 166, id(f_state), fg, TextAlign::TOP_CENTER,
+                    "%s", states[i]);
+        }
+        // ---- bottom row: TALK on the left, NOTE on the right ----
+        // The NOTE tile inverts when a note is set, so you can see at a glance
+        // that there is something on the fridge without opening it.
+        std::string nt = id(st_note).state;
+        bool have_note = !nt.empty() && nt != "unknown" && nt != "unavailable";
+        thick_box(12, 542, 222, 180, 3);
+        it.image(91, 566, id(ic_mic), INK, PAPER);
+        it.print(123, 648, id(f_tile), INK, TextAlign::TOP_CENTER, "${voice_label}");
+        if (have_note) {
+          it.filled_rectangle(246, 542, 222, 180, INK);
+          it.image(325, 566, id(ic_note), PAPER, INK);
+          it.print(357, 648, id(f_tile), PAPER, TextAlign::TOP_CENTER, "${note_label}");
+        } else {
+          thick_box(246, 542, 222, 180, 3);
+          it.image(325, 566, id(ic_note), INK, PAPER);
+          it.print(357, 648, id(f_tile), INK, TextAlign::TOP_CENTER, "${note_label}");
+        }
+        // ---- footer ----
+        if (id(temp_sensor).has_state()) {
+          it.printf(14, H - 16, id(f_small), INK, TextAlign::BASELINE_LEFT,
+                    "%.1f C", id(temp_sensor).state);
+        }
+        it.print(W - 14, H - 16, id(f_small), INK, TextAlign::BASELINE_RIGHT,
+                 "${footer_text}");
+        // Make the power mode visible on the device itself.
+        if (std::string("${low_power}") != "true") {
+          it.print(W / 2, H - 16, id(f_small), INK, TextAlign::BASELINE_CENTER,
+                   "always on");
+        }
+      }
+      // ====================== LISTENING =====================
+      else if (id(ui_mode) == 1) {
+        it.image(160, 200, id(ic_listening), INK, PAPER);
+        it.print(240, 400, id(f_head), INK, TextAlign::TOP_CENTER, "Listening...");
+        it.print(240, 452, id(f_body), INK, TextAlign::TOP_CENTER, "speak now");
+        it.filled_rectangle(60, 560, 360, 8, INK);
+        it.print(240, 700, id(f_small), INK, TextAlign::TOP_CENTER,
+                 "tap anywhere to cancel");
+      }
+      // ======================= THINKING =====================
+      else if (id(ui_mode) == 2) {
+        it.image(160, 200, id(ic_thinking), INK, PAPER);
+        it.print(240, 400, id(f_head), INK, TextAlign::TOP_CENTER, "Thinking...");
+        if (!id(last_heard).empty()) {
+          it.printf(240, 456, id(f_body), INK, TextAlign::TOP_CENTER,
+                    "\"%s\"", id(last_heard).c_str());
+        }
+      }
+      // ========================= NOTE =======================
+      else if (id(ui_mode) == 4) {
+        const bool card_only = id(note_sleep_card);
+        const int  cy1 = card_only ? 780 : 640;
+        wobbly_box(20, 62, W - 20, cy1);
+        wobbly_box(28, 70, W - 28, cy1 - 8);
+        it.image(48, 92, id(ic_accent), INK, PAPER);
+        it.print(48, 146, id(f_head), INK, TextAlign::TOP_LEFT, "${note_greeting}");
+        std::string nt = id(st_note).state;
+        if (nt == "unknown" || nt == "unavailable") nt = "";
+        if (nt.empty()) nt = "(no note)";
+        // Pick the biggest size the note actually fits in, rather than using
+        // one small size for everything. Most notes are a line or two, and a
+        // line or two of 31 px type floating in a 700 px card looks lost.
+        auto nl = wrap(nt, 16);
+        auto nf = id(f_note_xl);
+        int  lh = 64;
+        if (nl.size() > 3) { nl = wrap(nt, 21); nf = id(f_note_lg); lh = 52; }
+        if (nl.size() > 4) { nl = wrap(nt, 26); nf = id(f_reply);   lh = 44; }
+        // Centre the block in the space between the greeting and the doodle,
+        // so a one-line note sits where the eye lands instead of hugging the
+        // top with a void beneath it.
+        const int band_top = 206;
+        const int band_bot = cy1 - 170;
+        int blockh = (int) nl.size() * lh;
+        int ny = band_top + (band_bot - band_top - blockh) / 2;
+        if (ny < band_top) ny = band_top;
+        for (size_t i = 0; i < nl.size(); i++) {
+          it.print(44, ny, nf, INK, TextAlign::TOP_LEFT, nl[i].c_str());
+          ny += lh;
+        }
+        it.image(W - 170, cy1 - 150, id(ic_doodle), INK, PAPER);
+        // No buttons on the sleep card - nothing can be pressed while it is
+        // asleep, and drawing them would be a lie.
+        if (!card_only) {
+          // BACK  |  NEW  |  CLEAR
+          it.filled_rectangle(12, 660, 145, 92, INK);
+          it.print(84, 690, id(f_tile), PAPER, TextAlign::TOP_CENTER, "BACK");
+          thick_box(167, 660, 145, 92, 3);
+          it.print(239, 690, id(f_tile), INK, TextAlign::TOP_CENTER, "NEW");
+          thick_box(322, 660, 146, 92, 3);
+          it.print(395, 690, id(f_tile), INK, TextAlign::TOP_CENTER, "CLEAR");
+        }
+      }
+      // ======================== REPLY =======================
+      else {
+        // ---- what you asked: inverted band, full bleed. Same visual
+        // ---- language as an ON tile, so the panel reads as one system.
+        auto q = wrap(id(last_heard), 30);
+        if (q.size() > 2) q.resize(2);
+        int qh = 16 + (int) q.size() * 27 + 13;
+        it.filled_rectangle(0, 58, W, qh, INK);
+        for (size_t i = 0; i < q.size(); i++) {
+          it.print(W / 2, 58 + 14 + (int) i * 27, id(f_body), PAPER,
+                   TextAlign::TOP_CENTER, q[i].c_str());
+        }
+        // ---- the answer is the hero. Big, and optically centred in the
+        // ---- space between the band and the button rather than hugging
+        // ---- the top with a void underneath.
+        std::string rtext = id(last_reply).empty() ? std::string("(no reply)")
+                                                   : id(last_reply);
+        auto r = wrap(rtext, 24);
+        const int LH = 42;
+        int top   = 58 + qh;
+        int avail = 646 - top;
+        int blockh = (int) r.size() * LH;
+        int ry = top + (avail - blockh) / 2;
+        if (ry < top + 12) ry = top + 12;
+        for (size_t i = 0; i < r.size(); i++) {
+          it.print(W / 2, ry + (int) i * LH, id(f_reply), INK,
+                   TextAlign::TOP_CENTER, r[i].c_str());
+        }
+        // ---- BACK: full width, solid, unmissable.
+        // ---- Geometry must match the touch test in on_touch.
+        it.filled_rectangle(12, 660, 456, 92, INK);
+        it.image(157, 686, id(ic_back), PAPER, INK);
+        it.print(213, 684, id(f_head), PAPER, TextAlign::TOP_LEFT, "BACK");
+      }
+# Clock refresh. Goes through the same debounced path as everything else.
+interval:
+  - interval: 10min
+    then:
+      - script.execute: redraw
+button:
+  - platform: template
+    name: "Force Redraw"
+    on_press:
+      - script.execute: redraw
+  - platform: template
+    name: "Start Voice"
+    on_press:
+      - voice_assistant.start:
+  - platform: restart
+    name: "Restart"
+    entity_category: config
+# =============================================================================
+#  BUILD NOTES / HISTORY
+#  Kept for reference. Nothing here affects the config.
+# =============================================================================
+# =============================================================================
+#  reTerminal Sticky - Living Room controller  (v21)
+#
+#  PORTRAIT 480 x 800.
+#
+#      +------------+------------+
+#      | Main Light |   Cinema   |
+#      +------------+------------+
+#      |     TV     |   Blinds   |
+#      +------------+------------+
+#      |      TAP TO TALK        |
+#      +-------------------------+
+#
+#  ---------------------------------------------------------------------------
+#  v10 - TOUCH, SETTLED
+#  ---------------------------------------------------------------------------
+#  Final answer for this board at rotation: 90 -
+#      NO `transform:` on the touchscreen
+#      Touch Flip X = OFF
+#      Touch Flip Y = ON
+#
+#  Both flips are runtime switches in Home Assistant, so if you ever change
+#  the display rotation you re-calibrate by toggling, not recompiling.
+#
+#  How it was worked out: with both flips off, tapping the top row started a
+#  voice session (800 - 180 = 620, the voice tile) while tapping the sides of
+#  the voice tile toggled the light and the lamp (800 - 630 = 170, the top
+#  row). Left/right were landing correctly, so only Y was inverted.
+#
+#  ---------------------------------------------------------------------------
+#  v8 - TOUCH X MIRROR (superseded by v10)
+#  ---------------------------------------------------------------------------
+#  Tapping TV (left column) was hitting Blinds (right column). The footer
+#  dev-readout gave it away: the tap logged x=351 when it should have been
+#  ~120, and 480 - 351 = 129. A clean mirror, nothing subtler.
+#  transform now has BOTH mirror_x and mirror_y. Rows were already landing
+#  correctly, so only the horizontal axis needed flipping.
+#
+#  ---------------------------------------------------------------------------
+#  v7 - BATTERY
+#  ---------------------------------------------------------------------------
+#  Fuel gauge reads now. GPIO39 charger-enable had been missing from the
+#  config; with it driven the BQ27220 answers on 0x55.
+#
+#  ---------------------------------------------------------------------------
+#  v5 - THE COLOUR BUG
+#  ---------------------------------------------------------------------------
+#  COLOR_ON and COLOR_OFF are the opposite way round to what I assumed on this
+#  panel. On this ePaper, COLOR_OFF is the INK and COLOR_ON is the PAPER.
+#  v3/v4 drew borders, headers and OFF-state labels in COLOR_ON - i.e. white
+#  on white. Invisible. That single mistake produced every symptom:
+#
+#    - no tile borders anywhere        (drawn white)
+#    - no header, no clock, no battery (drawn white)
+#    - OFF tiles had no label          (drawn white)
+#    - ON tiles had no black fill      (fill drawn white) but DID show their
+#      icon and text, because those used COLOR_OFF = real ink
+#    - v3's grey boxes round the Main Light and Lamp icons were the icon
+#      BACKGROUND painted in COLOR_OFF - black - on the OFF tiles
+#    - the calibration screen was blank end to end: every element in it
+#      was drawn in COLOR_ON
+#
+#  Seeed's own examples use COLOR_OFF for everything, which is the tell I
+#  should have followed. The lambda now uses named INK / PAPER constants so
+#  this cannot happen again.
+#
+#  Also fixed: the "Display already in state POWER_OFF" spam. Ten different
+#  triggers were each calling component.update, so refreshes piled up on top
+#  of each other mid-cycle. Everything now goes through one debounced `redraw`
+#  script, so a burst of state changes collapses into a single refresh.
+#
+#  ---------------------------------------------------------------------------
+#  WHAT CHANGED IN v4, AND WHY
+#  ---------------------------------------------------------------------------
+#  A. full_update_every: 12 is GONE. That was the real villain. Partial
+#     refresh on this panel was silently dropping whole draw operations - it
+#     is why not one single rectangle appeared on the screen, and why the mic
+#     icon "breaks up" on tap. Every refresh is now a full one. Slower
+#     (roughly a second), completely reliable.
+#
+#     Knock-on effect: with no rectangles rendering, the ON tiles had no black
+#     fill - and their labels are drawn in WHITE for contrast against that
+#     fill. White text on white paper. That is why "Main Light" and "Lamp" had
+#     no captions while TV and Blinds did. One bug, two symptoms.
+#
+#  B. Touch Y axis flipped. Tapping Main Light (y~190) was landing on the
+#     voice tile (y~610) - 800 minus 190. The display model preset applies
+#     mirror_x, and once the panel is rotated 90 deg to portrait that becomes
+#     a flip along the axis the touchscreen thinks is X. The touchscreen has
+#     no way to know the display did that, so we tell it. See `transform:`.
+#     (Superseded by v10 - see the TOUCH AXES note above.)
+#
+#  C. Icons are TRANSPARENT_BINARY now, so they no longer carry an ugly filled
+#     box around them, and they are 96 px instead of 76.
+#
+#  D. Tiles have real 3 px borders and fill the screen properly.
+#
+#  ---------------------------------------------------------------------------
+#  TOUCH AXES
+#  ---------------------------------------------------------------------------
+#  No `transform:` on the touchscreen. Correction is done in software from two
+#  switches in Home Assistant, so a rotation change is a toggle, not a rebuild.
+#  Settled for this board at rotation: 90 -   Flip X = OFF,  Flip Y = ON
+#
+#  BUTTONS
+#    OK    start a voice session / dismiss a reply / wake
+#    UP    refresh the screen / wake
+#    DOWN  refresh the screen / wake
+# =============================================================================
