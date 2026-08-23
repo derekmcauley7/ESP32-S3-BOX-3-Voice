@@ -7,7 +7,7 @@
 #      +------------+------------+
 #      |   TILE 3   |   TILE 4   |
 #      +------------+------------+
-#      |      TAP TO TALK        |
+#      |   Voice    |   Note     |
 #      +-------------------------+
 #
 #  EVERYTHING YOU NEED TO CHANGE IS IN THE BLOCK DIRECTLY BELOW.
@@ -206,7 +206,7 @@ api:
     key: !secret api_encryption_key
 ota:
   - platform: esphome
-    password: !secret ota_password
+    password: !secret wifi_password
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
