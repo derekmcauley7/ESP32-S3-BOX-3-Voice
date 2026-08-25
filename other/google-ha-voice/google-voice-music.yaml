@@ -1,0 +1,1236 @@
+# =============================================================================
+# GOOGLE NEST MINI -> HOME ASSISTANT VOICE SATELLITE
+#
+# ESP32-S3 replacement board (Onju Voice) in a Google Nest Mini shell, running
+# as a Home Assistant Assist satellite with ON-DEVICE wake word detection via
+# microWakeWord.
+#
+# WHAT YOU NEED IN HOME ASSISTANT
+#   An Assist pipeline. That means speech-to-text, a conversation agent and
+#   text-to-speech - either a Home Assistant Cloud subscription, or local
+#   Whisper and Piper.
+#
+#   You do NOT need the openWakeWord app. The wake word runs on the ESP32
+#   itself, so nothing is streamed to Home Assistant until you say it.
+#
+# WHAT THIS DEVICE DOES
+#   Wake word, voice commands, spoken replies, and tap-to-talk on the centre
+#   touch pad. Volume on the side pads. It ALSO plays music: the media player
+#   below now has a media pipeline as well as an announcement one, mixed onto
+#   the single speaker.
+#
+# !! THIS IS THE SALVAGE ATTEMPT. READ IT BEFORE FLASHING. !!
+#
+#   The 48 kHz music build was flashed on 24 Aug and FAILED on this board.
+#   Not marginally - comprehensively. From that log:
+#     [E] mixer.speaker set Error flag: Not enough memory
+#     [E] resampler.speaker set Error flag: Not enough memory   (x hundreds)
+#     [E] micro_wake_word: Could not allocate the streaming model's tensor arena
+#     [E] i2s_std: allocate memory for dma descriptor failed
+#     [E] i2s_audio.speaker: Failed to initialize I2S channel
+#   Music did not play, the wake word died, and the speaker could not
+#   reinitialise afterwards. The board had to be reflashed.
+#
+#   This file is the cheapest possible retry, and it is a LONG SHOT:
+#     - 16 kHz mono everywhere instead of 48 kHz
+#     - both resamplers deleted outright
+#     - buffer_size 48000 -> 16000 (x2 pipelines = 32 KB, the same total the
+#       working announcement-only build used)
+#     - every ring buffer down to 50 ms
+#   Even so it is asking a no-PSRAM board to hold two decode pipelines, a
+#   mixer and a 45 KB tensor arena in ~155 KB of internal heap.
+#
+#   FLASH THIS WITH THE LOG VIEWER OPEN. If you see "Not enough memory" again,
+#   stop: this board cannot play music, and the answer is
+#   google-voice-1-announcement-only.yaml plus doing music on GV2 or GV3,
+#   which have 8 MB of PSRAM and where none of this is even close.
+#
+#   Two fixes in here are worth keeping REGARDLESS of whether music works:
+#   the wake-word self-heal guard and the new stuck-media watchdog. See the
+#   WATCHDOGS section.
+#
+# BEFORE YOU FLASH
+#   1. Generate your own API encryption key. Do not use a key from a video.
+#   2. Add these to secrets.yaml: wifi_ssid, wifi_password,
+#      google_voice_api_key, ota_password.
+#   3. Check the touch thresholds against your own board - the notes in the
+#      esp32_touch section explain how.
+# =============================================================================
+
+substitutions:
+  name: google-voice-1
+  friendly_name: Google Voice 1
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  name_add_mac_suffix: false
+  min_version: 2026.4.0
+  # Boot feedback on the LED ring: amber while connecting to wifi, pulsing
+  # green once wifi is up, solid green when the API connects, then dark.
+  on_boot:
+    then:
+      - light.turn_on:
+          id: top_led
+          effect: slow_pulse
+          red: 100%
+          green: 60%
+          blue: 0%
+      - wait_until:
+          condition:
+            wifi.connected:
+      - light.turn_on:
+          id: top_led
+          effect: pulse
+          red: 0%
+          green: 100%
+          blue: 0%
+      - wait_until:
+          condition:
+            api.connected:
+      - light.turn_on:
+          id: top_led
+          effect: none
+          red: 0%
+          green: 100%
+          blue: 0%
+      - delay: 1s
+      - script.execute: reset_led
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+    # Most microWakeWord examples also set:
+    #   sdkconfig_options:
+    #     CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
+    #     CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+    # That speeds up inference and is free on a board with PSRAM. On a board
+    # without it, the larger cache is carved out of the same internal SRAM the
+    # wake word model needs. Leave it off unless you have RAM to spare.
+
+# CONFIRMED NO PSRAM on this board. The boot log reads:
+#   [C][psram:018]: Available: NO
+# on octal/80MHz as well as quad/40MHz, so there is genuinely no chip fitted -
+# it is not a bus-width mismatch. Everything below that looks conservative
+# (small buffers, no task_stack_in_psram) is that way because of this.
+#
+# The media pipeline that plays music is the one thing here that is NOT
+# conservative, because it was asked for. It is the part most likely to fail on
+# this board. If it does, the failure mode is loud and early - a boot loop, or
+# "Failed to allocate tensors for the streaming model", or the player sticking
+# in ANNOUNCING - and the fix is to lower buffer_size, or to delete the
+# media_pipeline block again.
+#
+# If your board DOES report Available: YES, raise buffer_size to 1000000 and set
+# task_stack_in_psram: true in the micro_wake_word block.
+psram:
+  mode: quad
+  speed: 40MHz
+
+# INFO rather than DEBUG. Streaming debug logs over the API costs CPU on a
+# board that is already busy running wake word inference.
+#
+# WHEN TUNING THE WAKE WORD, temporarily add:
+#   logs:
+#     micro_wake_word: DEBUG
+# That prints the probability of every detection, which is how you choose a
+# cutoff instead of guessing. Take it out once you have settled on a number.
+logger:
+  level: INFO
+
+api:
+  encryption:
+    # REPLACE THIS. Generate your own at:
+    # https://esphome.io/components/api/#configuration-variables
+    key: !secret google_voice_api_key
+  # Optional. Lets a Home Assistant automation start or stop a voice request
+  # on this device, e.g. from a dashboard button.
+  actions:
+    - action: start_va
+      then:
+        # Stop the wake word first - it owns the microphone.
+        - micro_wake_word.stop:
+        - voice_assistant.start:
+    - action: stop_va
+      then:
+        - voice_assistant.stop:
+        - script.execute: restore_wake_word
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+# Safe mode is set up automatically by the OTA component above, but the default
+# is ten failed boots before it kicks in - a long loop to sit through. Three is
+# enough to be sure it is not a one-off, and gets you to a recoverable state
+# fast. Relevant here because a wake word model that cannot allocate its tensor
+# arena is exactly the kind of failure that boot-loops.
+safe_mode:
+  num_attempts: 3
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Wifi power saving introduces latency that shows up as clipped or delayed
+  # audio. Leave this off.
+  power_save_mode: none
+  # Fallback hotspot, used only if the device cannot join your wifi. Reusing
+  # wifi_password keeps this to one secret; use a separate one if you would
+  # rather the recovery AP not share credentials with your network.
+  ap:
+    password: !secret wifi_password
+
+captive_portal:
+
+# ---------------------------------------------------------------------------
+# GLOBALS
+# ---------------------------------------------------------------------------
+globals:
+  # Seconds the media player has been "announcing" with no audio coming out.
+  # Drives the stuck-announcement watchdog.
+  - id: announce_ticks
+    type: int
+    restore_value: false
+    initial_value: "0"
+  # Set when an announcement starts, so the media player's on_idle can tell a
+  # finished announcement apart from an unrelated state publish.
+  - id: was_announcing
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  # Same idea for the media (music) pipeline. on_idle fires for both, and both
+  # have to hand the microphone back when they finish.
+  - id: was_playing
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  # Seconds the media player has claimed to be playing with no sound coming
+  # out. Drives the stuck-media watchdog.
+  - id: media_stall_ticks
+    type: int
+    restore_value: false
+    initial_value: "0"
+  # True while a turn was started by tapping the touch pad rather than by the
+  # wake word, so we know to restart wake word listening afterwards.
+  - id: manual_request
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  # Seconds the wake word has been stopped while it should have been running.
+  # Drives the self-heal below.
+  - id: mww_idle_ticks
+    type: int
+    restore_value: false
+    initial_value: "0"
+  # millis() when a tap-to-talk request started, for the stuck-request
+  # watchdog below.
+  - id: manual_start_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+# ---------------------------------------------------------------------------
+# WATCHDOGS
+#
+# Three cheap checks on a 1 Hz timer. None of them should ever fire on a
+# healthy device - they exist so that a single transient failure cannot leave
+# the satellite permanently deaf, which is otherwise the most common way one
+# of these goes quiet after days of uptime.
+# ---------------------------------------------------------------------------
+interval:
+  - interval: 1s
+    then:
+      # -------------------------------------------------------------------
+      # STUCK ANNOUNCEMENT
+      #
+      # If the device cannot fetch a TTS URL, the media player can get stuck
+      # re-issuing the request forever - you will see a flood of
+      # "Media reader encountered an error: ESP_FAIL" in the log. Only
+      # media_player.stop breaks the loop, because its handler clears the
+      # announcement playlist.
+      #
+      # The condition is "announcing AND the speaker is not actually playing",
+      # so a long genuine reply never trips it.
+      # -------------------------------------------------------------------
+      - if:
+          condition:
+            and:
+              - media_player.is_announcing:
+              - not:
+                  speaker.is_playing: onju_speaker
+          then:
+            - lambda: id(announce_ticks)++;
+            - if:
+                condition:
+                  lambda: "return id(announce_ticks) > 8;"
+                then:
+                  - logger.log:
+                      tag: "watchdog"
+                      level: WARN
+                      format: "Announcing for 8s with no audio - forcing stop"
+                  - media_player.stop:
+                      id: onju_out
+                      announcement: true
+                  - lambda: id(announce_ticks) = 0;
+                  - script.execute: restore_wake_word
+                  - script.execute: reset_led
+          else:
+            - lambda: id(announce_ticks) = 0;
+
+      # -------------------------------------------------------------------
+      # WAKE WORD SELF-HEAL
+      #
+      # Any path that fails to reach restore_wake_word leaves the wake word
+      # stopped: a dropped API connection mid-turn, a media_player.stop that
+      # produces no on_idle, a script that dies. The symptom is that the
+      # device stops answering but the touch pad still works.
+      #
+      # Every clause below matters:
+      #   switch off      the user asked for silence, respect it
+      #   API down        nothing to send audio to
+      #   VA running      a turn is in progress, wake word is meant to be off
+      #   announcing      the speaker owns the I2S bus - do not take the mic
+      #   speaker playing same again, but covers MUSIC as well as announcements.
+      #                   Without this clause the self-heal would restart the
+      #                   wake word 10 s into every song and fight the mutex.
+      #   was_playing     THE BUG THE 48 kHz BUILD EXPOSED. speaker.is_playing
+      #                   was not enough on its own: while the media pipeline
+      #                   was failing to allocate, the media player sat in
+      #                   PLAYING but the speaker had never actually started,
+      #                   so this guard passed and the watchdog restarted the
+      #                   wake word straight into a board that had no memory
+      #                   left. In the log, 10 s after playback "began":
+      #                     [W][watchdog]: Wake word idle for 10s - restarting
+      #                     [E][micro_wake_word]: Could not allocate the
+      #                                           streaming model's tensor arena
+      #                   The intent is "is the media player supposed to be
+      #                   playing", which is a different question from "is
+      #                   sound coming out", and this is the flag that answers
+      #                   it. The new stuck-media watchdog below clears it, so
+      #                   a failed playback cannot wedge this off forever.
+      #   manual_request  tap-to-talk in progress
+      # -------------------------------------------------------------------
+      - if:
+          condition:
+            and:
+              - switch.is_on: use_wake_word
+              - api.connected:
+              - not:
+                  micro_wake_word.is_running:
+              - not:
+                  voice_assistant.is_running:
+              - not:
+                  media_player.is_announcing:
+              - not:
+                  speaker.is_playing: onju_speaker
+              - lambda: "return !id(manual_request) && !id(was_playing);"
+          then:
+            - lambda: id(mww_idle_ticks)++;
+            - if:
+                condition:
+                  lambda: "return id(mww_idle_ticks) > 10;"
+                then:
+                  - logger.log:
+                      tag: "watchdog"
+                      level: WARN
+                      format: "Wake word idle for 10s while it should be listening - restarting"
+                  - lambda: id(mww_idle_ticks) = 0;
+                  - micro_wake_word.start:
+          else:
+            - lambda: id(mww_idle_ticks) = 0;
+
+      # -------------------------------------------------------------------
+      # STUCK MEDIA (music that never actually starts)
+      #
+      # New, and written directly from the failed 48 kHz flash. The media
+      # player reported PLAYING at 17:47:37 and the speaker did not come up
+      # until 17:47:52 - fifteen seconds during which the device was neither
+      # playing music nor listening, and every component in the audio chain
+      # was logging "Not enough memory" hundreds of times a second.
+      #
+      # was_playing now suppresses the wake-word self-heal, so something has
+      # to be willing to give up. If the media player claims to be playing and
+      # no sound has come out for 10 s, stop it, clear the flag and hand the
+      # microphone back. A real song keeps the speaker running, so this cannot
+      # fire mid-track.
+      # -------------------------------------------------------------------
+      - if:
+          condition:
+            and:
+              - lambda: "return id(was_playing);"
+              - not:
+                  speaker.is_playing: onju_speaker
+              - not:
+                  media_player.is_announcing:
+          then:
+            - lambda: id(media_stall_ticks)++;
+            - if:
+                condition:
+                  lambda: "return id(media_stall_ticks) > 10;"
+                then:
+                  - logger.log:
+                      tag: "watchdog"
+                      level: WARN
+                      format: "Media player playing for 10s with no audio - forcing stop"
+                  - lambda: |-
+                      id(media_stall_ticks) = 0;
+                      id(was_playing) = false;
+                  - media_player.stop:
+                      id: onju_out
+                      announcement: false
+                  - script.execute: restore_wake_word
+                  - script.execute: reset_led
+          else:
+            - lambda: id(media_stall_ticks) = 0;
+
+      # -------------------------------------------------------------------
+      # STUCK TAP-TO-TALK REQUEST
+      #
+      # While manual_request is true the self-heal above deliberately stands
+      # down, so if restore_wake_word is ever missed the device is left deaf.
+      # No real tap-to-talk turn lasts 20 seconds, so force the restore.
+      # -------------------------------------------------------------------
+      - if:
+          condition:
+            and:
+              - lambda: "return id(manual_request) && ((millis() - id(manual_start_ms)) > 20000);"
+              - not:
+                  media_player.is_announcing:
+          then:
+            - logger.log:
+                tag: "watchdog"
+                level: WARN
+                format: "Tap-to-talk stuck for 20s - forcing wake word restore"
+            - script.execute: restore_wake_word
+
+# ---------------------------------------------------------------------------
+# AUDIO
+#
+# The microphone and the speaker share ONE I2S bus, and in ESPHome that bus is
+# NOT full duplex - it is guarded by a mutex, so only one of them can hold it
+# at a time. If the mic still has it when the speaker tries to start, you get
+# "Driver failed to start; retrying in 1 second" and a silent reply.
+#
+# This is the single most important thing to understand about this config.
+# microWakeWord holds the microphone continuously while it is listening, so
+# every point in this file that stops the wake word before audio plays is
+# doing so because of this mutex. There are four such points:
+#   - stop_after_detection, which stops it when the wake word fires
+#   - the media player's on_announcement, for announcements from Home
+#     Assistant that arrive out of the blue
+#   - the media player's on_play, for music
+#   - restore_wake_word, which waits for the speaker before starting again
+#
+# THE CONSEQUENCE OF MUSIC, spelled out because it surprises people: while
+# music is playing the microphone is not listening. The device cannot hear
+# "hey jarvis, stop". Stop it from Home Assistant, or tap the centre pad.
+#
+# The pad is context-sensitive, and only does one thing per tap:
+#   music playing -> STOP the music. The mic does not open.
+#   otherwise     -> tap-to-talk, as it has always been.
+# To give a command over music: tap to stop, then tap again to talk.
+# See start_manual_request for why it is not both at once.
+# ---------------------------------------------------------------------------
+i2s_audio:
+  - i2s_lrclk_pin: GPIO13
+    i2s_bclk_pin: GPIO18
+
+speaker:
+  # ---- 1. The real speaker ------------------------------------------------
+  - platform: i2s_audio
+    id: onju_speaker
+    dac_type: external
+    i2s_dout_pin: GPIO12
+    channel: mono
+    # 16 kHz, not 48. This is the biggest single saving in the file, and the
+    # reason the resamplers below are GONE: at 16 kHz both pipelines already
+    # match the speaker, so nothing needs resampling and two whole components
+    # with their own buffers disappear. Home Assistant transcodes the music
+    # down before sending it, so this board never does the work.
+    #
+    # Music at 16 kHz mono is AM-radio quality. That is the deal being struck.
+    sample_rate: 16000
+    bits_per_sample: 16bit
+    # 50ms. At 16 kHz mono that is 1600 bytes. Every buffer in this file is now
+    # sized for a board with ~155 KB of internal heap and no PSRAM.
+    buffer_duration: 50ms
+    # timeout: WHY THIS IS NO LONGER `never`.
+    #
+    # `never` was here as the clipped-reply fix: the speaker task used to break
+    # out of its playback loop a fixed time after the last data arrived and
+    # discard whatever was still buffered. Handover §6 theory 2 tested that and
+    # disproved it - `timeout: never` changed no measurement - and explicitly
+    # says reverting is reasonable since it earned nothing.
+    #
+    # With a mixer in front it becomes actively harmful to keep. The mixer
+    # feeds this speaker continuously (silence included) for as long as any
+    # source is active, so the timeout can no longer cut a reply short; all it
+    # does now is release the I2S mutex back to the microphone once the mixer
+    # goes quiet. Set `never` and, on any path where the mixer does not shut
+    # down cleanly, the speaker holds the bus forever and the device goes
+    # permanently deaf.
+    timeout: 500ms
+
+  # ---- 2. The mixer: two pipelines, one speaker ---------------------------
+  #
+  # ESPHome will not let an announcement pipeline and a media pipeline point at
+  # the same speaker directly - it rejects the config. The mixer is the
+  # supported way round it: two virtual source speakers summed into the real
+  # one. The nice side effect is that a TTS reply ducks in over music instead
+  # of killing it.
+  - platform: mixer
+    id: mixing_speaker
+    output_speaker: onju_speaker
+    num_channels: 1
+    source_speakers:
+      - id: announcement_mixing_input
+        # never on the SOURCES, so a mixing input is not torn down between
+        # chunks of the same reply. Ending playback is the output speaker's
+        # job, above.
+        timeout: never
+        buffer_duration: 50ms
+      - id: media_mixing_input
+        timeout: never
+        buffer_duration: 50ms
+
+  # ---- 3. NO RESAMPLERS ---------------------------------------------------
+  # The 48 kHz build had two resampler speakers here, and the log showed both
+  # of them thrashing:
+  #   [E] resampler.speaker set Error flag: Not enough memory
+  # over and over, hundreds of times a second. They are deleted, not shrunk.
+  # With the speaker at 16 kHz and both pipelines told to send 16 kHz, there is
+  # nothing left to resample, so the pipelines below feed the mixer's source
+  # speakers directly.
+
+output:
+  - platform: gpio
+    id: dac_mute_pin
+    pin:
+      number: GPIO21
+      inverted: True
+
+media_player:
+  - platform: speaker
+    name: None
+    id: onju_out
+    # TWO PIPELINES, both feeding a mixer source speaker DIRECTLY - no
+    # resampler in between, because everything here is 16 kHz mono.
+    #
+    # sample_rate is stated explicitly on both. That is what makes Home
+    # Assistant transcode down to 16 kHz before it sends anything, which is
+    # what makes the resamplers unnecessary.
+    announcement_pipeline:
+      speaker: announcement_mixing_input
+      format: FLAC
+      sample_rate: 16000
+      num_channels: 1
+    media_pipeline:
+      speaker: media_mixing_input
+      format: FLAC
+      sample_rate: 16000
+      num_channels: 1
+    # buffer_size: THE NUMBER THAT KILLED THE 48 kHz BUILD.
+    #
+    # This is allocated PER PIPELINE. At 48000 that was ~96 KB of transfer
+    # buffer on a board whose whole internal heap is ~155 KB, before the FLAC
+    # decoders and the wake word's ~45 KB tensor arena. The log is unambiguous
+    # about what happened next:
+    #   [E] mixer.speaker set Error flag: Not enough memory
+    #   [E] micro_wake_word: Could not allocate the streaming model's tensor arena
+    #   [E] i2s_std: allocate memory for dma descriptor failed
+    # Everything failed, including the parts that used to work.
+    #
+    # 16000 x 2 = 32 KB. That is the same total the announcement-only build
+    # used for its single 32000 buffer, so this is a genuine like-for-like
+    # budget rather than optimism.
+    #
+    # IF IT STILL FAILS, it fails - see the verdict at the top of this file.
+    buffer_size: 16000
+    on_mute:
+      - output.turn_on: dac_mute_pin
+    on_unmute:
+      - output.turn_off: dac_mute_pin
+    on_announcement:
+      - lambda: id(was_announcing) = true;
+      # Free the microphone so the speaker can take the I2S bus. In a normal
+      # wake word turn this has already happened, but an announcement can also
+      # arrive unprompted from a Home Assistant automation while the device is
+      # sitting there listening. Without this line, those announcements are
+      # silent.
+      - micro_wake_word.stop:
+    # on_play fires for the MEDIA pipeline. Announcements set the internal
+    # state to ANNOUNCING and land in on_announcement above instead - note that
+    # HA is shown PLAYING for both, which is the gotcha in the handover; this
+    # trigger reads the internal state, so it is not affected.
+    on_play:
+      - lambda: id(was_playing) = true;
+      # Same mutex, same reason as on_announcement. The microphone has to let
+      # go of the bus before the speaker can take it, and music holds the bus
+      # for minutes rather than seconds.
+      - micro_wake_word.stop:
+    # Pausing stops the speaker, which frees the bus - so hand the microphone
+    # back rather than leaving the device deaf for as long as the user leaves
+    # it paused. Resuming fires on_play again and takes it back.
+    on_pause:
+      - script.execute: restore_wake_word
+    # on_idle fires on every state publish where the state is IDLE, including
+    # volume changes, so check the flags rather than acting every time.
+    on_idle:
+      - if:
+          condition:
+            lambda: "return id(was_announcing) || id(was_playing);"
+          then:
+            - lambda: |-
+                id(was_announcing) = false;
+                id(was_playing) = false;
+            - script.execute: restore_wake_word
+            - script.execute: reset_led
+
+microphone:
+  - platform: i2s_audio
+    id: onju_microphone
+    i2s_din_pin: GPIO17
+    adc_type: external
+    pdm: false
+
+# ---------------------------------------------------------------------------
+# WAKE WORD  --  runs entirely on the ESP32
+#
+# TUNING, if the device keeps answering the television:
+#
+#   probability_cutoff
+#     Raise it to make the device harder to trigger. Most model files ship
+#     0.97. 0.98 is noticeably tighter and still comfortable to say. 0.99
+#     starts to make you repeat yourself. Don't go below 0.95.
+#
+#   sliding_window_size
+#     The number of consecutive inference frames averaged before the cutoff is
+#     applied, and the better lever for TV audio. Broadcast speech that happens
+#     to sound like the wake word produces one brief probability spike as it
+#     goes past; a person actually addressing the device produces a sustained
+#     high average. Widening the window from the model default of 5 to 8
+#     filters the spike and barely affects the real case, at a cost of about
+#     30 ms of latency. Try 8, then 10.
+#
+#   vad
+#     A Voice Activity Detection model that gates every detection behind "is
+#     this actually human speech". The best single defence against false
+#     accepts, and the reason a laugh track or a door slam no longer wakes the
+#     device. It does cost RAM - see below.
+#
+# METHOD: set micro_wake_word to DEBUG in the logger block, leave the TV on for
+# an evening, and read the probabilities of the false triggers out of the log.
+# Set your cutoff just above them.
+#
+# IF THE LOG FILLS WITH "Not enough free bytes in ring buffer"
+# That is a CPU problem, not a memory one - check "Free internal heap" first,
+# and if it is healthy (this board sits around 155 KB) the loop is being
+# stalled and the microphone buffer overruns. In order: close the ESPHome log
+# viewer, since streaming logs over the API is itself significant load; set
+# logger back to INFO; raise esp32_touch sleep_duration. If it still happens,
+# comment out `vad:` below - it roughly halves the inference work per frame.
+#
+# IF IT FAILS TO ALLOCATE ON BOOT
+# On a board without PSRAM the model's tensor arena comes out of internal RAM,
+# and you may see "Failed to allocate tensors for the streaming model". In
+# order: comment out `vad:`, then pin an older and smaller model with
+#   - model: github://esphome/micro-wake-word-models/models/hey_jarvis.json@main
+# Watch the "Largest free block" sensor further down for the first few days.
+#
+# CHANGING THE WAKE WORD means editing this block and reflashing. Available
+# names live at github.com/esphome/micro-wake-word-models - okay_nabu,
+# hey_jarvis, alexa and others. The wake word chosen in your Home Assistant
+# pipeline settings has no effect on this device.
+# ---------------------------------------------------------------------------
+micro_wake_word:
+  id: mww
+  microphone:
+    microphone: onju_microphone
+    # gain_factor is deliberately left at its default of 1. Raising it makes
+    # the television louder to the model too, which is the wrong direction if
+    # false triggers are your problem. If the device is hard to trigger from
+    # across the room, try 2 before 4.
+  stop_after_detection: true
+  # vad: DISABLED FOR TESTING (22 Aug).
+  # The VAD model is a second inference per frame. With it on, this board could
+  # not keep up and the microphone ring buffer overran continuously:
+  #   [W][micro_wake_word:422]: Not enough free bytes in ring buffer
+  # Re-enable it if the CPU load is solved another way - it is the best single
+  # defence against false triggers from the television.
+  # vad:
+  models:
+    - model: hey_jarvis
+      probability_cutoff: 0.98
+      sliding_window_size: 8
+  on_wake_word_detected:
+    - light.turn_on:
+        id: top_led
+        blue: 100%
+        red: 0%
+        green: 0%
+        effect: none
+    - voice_assistant.start:
+        wake_word: !lambda return wake_word;
+
+voice_assistant:
+  microphone:
+    microphone: onju_microphone
+  media_player: onju_out
+  # Pointing the voice assistant at the wake word component lets Home
+  # Assistant see and switch the enabled model from the device page, rather
+  # than the wake word being invisible firmware.
+  micro_wake_word: mww
+  # Note there is no `use_wake_word:` here. That option asks HOME ASSISTANT to
+  # run a wake word stage, which is exactly what we are avoiding. By the time
+  # voice_assistant.start is called, the wake word has already been detected
+  # on device.
+  on_listening:
+    - light.turn_on:
+        id: top_led
+        blue: 100%
+        red: 0%
+        green: 0%
+        brightness: 100%
+        effect: pulse
+  on_tts_end:
+    - light.turn_on:
+        id: top_led
+        blue: 0%
+        red: 20%
+        green: 100%
+        effect: pulse
+  on_end:
+    # This fires when Home Assistant finishes the pipeline run, which is
+    # BEFORE the reply plays, not after. Do not put media_player.stop here -
+    # it discards the buffered audio instead of draining it, and clips the
+    # reply.
+    #
+    # The 1 s delay gives the announcement time to start so the check below
+    # means something. If a reply did play, the media player's on_idle handles
+    # the restore instead. This path covers turns with no spoken reply.
+    - delay: 1s
+    - if:
+        condition:
+          not:
+            media_player.is_announcing:
+        then:
+          - script.execute: restore_wake_word
+          - script.execute: reset_led
+  on_client_connected:
+    - script.execute: restore_wake_word
+  on_client_disconnected:
+    - micro_wake_word.stop:
+    - voice_assistant.stop:
+  on_error:
+    # The trigger hands you `code` and `message`. Without this you get a red
+    # ring and no idea what went wrong.
+    - logger.log:
+        tag: "voice_assistant"
+        level: WARN
+        format: "Voice assistant error: %s - %s"
+        args: ['code.c_str()', 'message.c_str()']
+    - light.turn_on:
+        id: top_led
+        blue: 0%
+        red: 100%
+        green: 0%
+    - delay: 1s
+    - media_player.stop:
+        id: onju_out
+        announcement: true
+    - script.execute: restore_wake_word
+    - script.execute: reset_led
+  # -------------------------------------------------------------------------
+  # TIMERS
+  #
+  # "Set a timer for ten minutes" creates the timer ON THIS DEVICE, not in
+  # Home Assistant. Without these handlers the timer runs and expires in total
+  # silence, which looks exactly like the feature being broken.
+  #
+  # The alert is the LED ring. There IS a media pipeline now, so an audible
+  # chime is possible - either call media_player.play_media back at this device
+  # from a Home Assistant automation, or add a media_player.play_media action
+  # to on_timer_finished below pointing at a URL your HA can serve. Kept as
+  # lights-only here so the timer cannot interrupt music.
+  # -------------------------------------------------------------------------
+  on_timer_started:
+    - light.turn_on:
+        id: top_led
+        red: 100%
+        green: 60%
+        blue: 0%
+        effect: pulse
+    - delay: 2s
+    - script.execute: reset_led
+  on_timer_finished:
+    - script.execute: timer_finished
+
+# ---------------------------------------------------------------------------
+# TOUCH PADS
+#
+# Two things catch people out on the ESP32-S3, and both will leave you with
+# pads that never fire:
+#
+# 1. THRESHOLDS ARE DELTAS, NOT ABSOLUTES. On the original ESP32 the threshold
+#    was an absolute reading. On the S2, S3 and P4 it is a delta above the
+#    hardware benchmark. Older configs floating around use six-figure values
+#    copied from the classic ESP32 - as deltas those can never be crossed.
+#
+# 2. MEASUREMENT DURATION. 800us saturates the readings on an S3. 250us works.
+#
+# TO FIND YOUR OWN NUMBERS: set `setup_mode: true` below, watch the log, and
+# note the idle noise floor and the jump when you touch each pad. Pick a
+# threshold comfortably above the noise and well below the touch. On the board
+# these values came from, idle noise was around +/-230 and a finger produced
+# +4400 to +5400. Turn setup_mode back off afterwards - it logs several lines
+# every 250 ms and starves the measurement loop.
+# ---------------------------------------------------------------------------
+esp32_touch:
+  setup_mode: false
+  # sleep_duration is the gap BETWEEN scans. At 500us the touch hub measures
+  # almost continuously and can stall the main loop - you will see
+  # "esp32_touch took a long time for an operation" in the log, and on this
+  # board that stall is long enough for the wake word's microphone ring buffer
+  # to overflow ("Not enough free bytes in ring buffer").
+  #
+  # 2ms is still 500 scans a second, far faster than a finger. If the pads feel
+  # sluggish, come down to 1ms rather than back to 500us.
+  sleep_duration: 2ms
+  measurement_duration: 250us
+  low_voltage_reference: 0.8V
+  high_voltage_reference: 2.4V
+  filter_mode: IIR_16
+  debounce_count: 2
+  noise_threshold: 0
+  jitter_step: 0
+  smooth_mode: IIR_2
+  denoise_grade: BIT8
+  denoise_cap_level: L0
+
+binary_sensor:
+  - platform: esp32_touch
+    id: volume_down
+    pin: GPIO4
+    # The side pads are physically smaller than the centre pad and produce a
+    # smaller delta, so they need a lower threshold. If you get phantom volume
+    # changes, raise this to 2000 rather than matching the centre pad.
+    threshold: 1500
+    on_press:
+      then:
+        - light.turn_on: left_led
+        - script.execute:
+            id: set_volume
+            volume: -0.05
+        # Hold to repeat.
+        - delay: 750ms
+        - while:
+            condition:
+              binary_sensor.is_on: volume_down
+            then:
+              - script.execute:
+                  id: set_volume
+                  volume: -0.05
+              - delay: 150ms
+    on_release:
+      then:
+        - light.turn_off: left_led
+
+  - platform: esp32_touch
+    id: volume_up
+    pin: GPIO2
+    threshold: 1500
+    on_press:
+      then:
+        - light.turn_on: right_led
+        - script.execute:
+            id: set_volume
+            volume: 0.05
+        - delay: 750ms
+        - while:
+            condition:
+              binary_sensor.is_on: volume_up
+            then:
+              - script.execute:
+                  id: set_volume
+                  volume: 0.05
+              - delay: 150ms
+    on_release:
+      then:
+        - light.turn_off: right_led
+
+  # Centre pad: tap to talk without saying the wake word.
+  - platform: esp32_touch
+    id: action
+    pin: GPIO3
+    threshold: 3000
+    on_click:
+      - script.execute: start_manual_request
+
+  # The physical mic-mute slider on the back edge of the Nest Mini.
+  #
+  # NOTHING IS WIRED TO THIS ON PURPOSE. This pin can flap, and when it does,
+  # any handler that disables the wake word will silently kill listening. The
+  # entity is exposed so you can see the slider position in Home Assistant;
+  # use the "Use Wake Word" switch below to actually mute the device.
+  - platform: gpio
+    pin:
+      number: GPIO38
+      mode: INPUT_PULLUP
+    name: Disable wake word
+
+  - platform: status
+    id: api_connection
+    filters:
+      - delayed_on: 1s
+    on_press:
+      - script.execute: restore_wake_word
+    on_release:
+      - micro_wake_word.stop:
+      - voice_assistant.stop:
+
+  # ---- DIAGNOSTICS -------------------------------------------------------
+  # The most useful entity here is "Wake word listening". It should read ON
+  # whenever the device is idle, and OFF only during a turn or a reply. If it
+  # sits OFF while the device is idle, the wake word is not running and the
+  # self-heal is failing.
+  - platform: template
+    name: "Wake word listening"
+    lambda: "return id(mww).is_running();"
+
+  - platform: template
+    name: "Speaker running"
+    lambda: "return id(onju_speaker).is_running();"
+
+  - platform: template
+    name: "Announcing"
+    lambda: "return id(onju_out).state == media_player::MEDIA_PLAYER_STATE_ANNOUNCING;"
+
+light:
+  - platform: esp32_rmt_led_strip
+    id: leds
+    name: "LED Ring"
+    pin: GPIO11
+    chipset: SK6812
+    num_leds: 6
+    channel_colors: GRB
+    default_transition_length: 0s
+    gamma_correct: 2.8
+  - platform: partition
+    id: left_led
+    name: "Left LED"
+    segments:
+      - id: leds
+        from: 0
+        to: 0
+  - platform: partition
+    id: top_led
+    name: "Top LED"
+    segments:
+      - id: leds
+        from: 1
+        to: 4
+    effects:
+      - pulse:
+          name: pulse
+          transition_length: 250ms
+          update_interval: 250ms
+      - pulse:
+          name: slow_pulse
+          transition_length: 1s
+          update_interval: 2s
+      # Lights the ring as a volume bar while the side pads are held.
+      - addressable_lambda:
+          name: show_volume
+          update_interval: 50ms
+          lambda: |-
+            int int_volume = int(id(onju_out).volume * 100.0f * it.size());
+            int full_leds = int_volume / 100;
+            int last_brightness = int_volume % 100;
+            int i = 0;
+            for(; i < full_leds; i++) {
+              it[i] = Color::WHITE;
+            }
+            if(i < 4) {
+              it[i++] = Color(0,0,0).fade_to_white(last_brightness*256/100);
+            }
+            for(; i < it.size(); i++) {
+              it[i] = Color::BLACK;
+            }
+  - platform: partition
+    id: right_led
+    name: "Right LED"
+    segments:
+      - id: leds
+        from: 5
+        to: 5
+
+# ---------------------------------------------------------------------------
+# DIAGNOSTIC SENSORS
+#
+# 300s rather than every minute. The debug component allocates and formats on
+# every update, and it can take tens of milliseconds - long enough to stall the
+# loop right as an announcement starts.
+#
+# WATCH "Largest free block" for the first week. The wake word model's tensor
+# arena comes out of internal RAM on a board with no PSRAM. If that number
+# trends downwards over hours you have a leak; if it starts below about 60 KB
+# you are one allocation away from a crash.
+# ---------------------------------------------------------------------------
+debug:
+  update_interval: 300s
+
+sensor:
+  - platform: uptime
+    name: "Uptime"
+    update_interval: 60s
+
+  - platform: debug
+    free:
+      name: "Free internal heap"
+      entity_category: diagnostic
+    block:
+      name: "Largest free block"
+      entity_category: diagnostic
+    psram:
+      name: "Free PSRAM"
+      entity_category: diagnostic
+
+  - platform: template
+    name: "Speaker volume"
+    lambda: "return id(onju_out).volume;"
+    accuracy_decimals: 2
+    update_interval: 60s
+
+text_sensor:
+  - platform: debug
+    reset_reason:
+      name: "Reset reason"
+
+script:
+  # -------------------------------------------------------------------------
+  # TAP TO TALK
+  #
+  # Stop the wake word so the microphone is free, clear any stuck
+  # announcement so a wedged pipeline cannot block a new request, wait for the
+  # voice assistant to actually reach idle, then start.
+  # -------------------------------------------------------------------------
+  - id: start_manual_request
+    mode: restart
+    then:
+      # A tap doubles as "dismiss the timer alert".
+      - script.stop: timer_finished
+      # -----------------------------------------------------------------------
+      # THE PAD DOES ONE JOB AT A TIME, DECIDED BY WHETHER MUSIC IS PLAYING.
+      #
+      # It used to do both: stop the music AND open a listening turn, because
+      # the media stop was bolted onto the front of the tap-to-talk sequence.
+      # That is wrong. Reaching out to stop a song is not a request to be
+      # listened to, and having the ring go blue and the mic open every time
+      # you silence the speaker is the opposite of what the gesture means.
+      #
+      #   music playing -> tap means STOP. Nothing else.
+      #   otherwise     -> tap means TALK, exactly as before.
+      #
+      # Want to give a command while music is playing? Tap once to stop, tap
+      # again to talk. Two deliberate gestures, no guessing.
+      # -----------------------------------------------------------------------
+      - if:
+          condition:
+            lambda: "return id(was_playing);"
+          then:
+            # Deliberately NOT clearing was_playing here. The media player's
+            # on_idle needs to see it to run restore_wake_word and reset_led,
+            # and clearing it early would strand the wake word off until the
+            # self-heal watchdog noticed. Let the normal end-of-playback path
+            # do its job.
+            - media_player.stop:
+                id: onju_out
+                announcement: false
+            # Belt and braces. restore_wake_word is mode: restart and waits for
+            # the speaker, so if on_idle also calls it the two collapse into
+            # one and nothing races.
+            - script.execute: restore_wake_word
+            - script.execute: reset_led
+          else:
+            - lambda: |-
+                id(manual_request) = true;
+                id(manual_start_ms) = millis();
+            - micro_wake_word.stop:
+            - media_player.stop:
+                id: onju_out
+                announcement: true
+            # Still stop the media pipeline on this branch. was_playing should
+            # be false here, but if it ever went stale the media pipeline would
+            # be holding the speaker, the speaker holds the I2S mutex, and the
+            # microphone could not record. Cheap insurance, no side effect when
+            # nothing is playing.
+            - media_player.stop:
+                id: onju_out
+                announcement: false
+            - voice_assistant.stop:
+            - wait_until:
+                condition:
+                  not:
+                    voice_assistant.is_running:
+                timeout: 3s
+            - light.turn_on:
+                id: top_led
+                blue: 100%
+                red: 0%
+                green: 0%
+                brightness: 100%
+                effect: pulse
+            - voice_assistant.start:
+
+  # -------------------------------------------------------------------------
+  # RESTORE WAKE WORD  --  the only place the wake word is ever restarted
+  #
+  # Every end-of-turn path funnels through here so the ordering rules live in
+  # one place. Safe to call at any time, from any state.
+  #
+  # THE TWO WAITS ARE NOT OPTIONAL. Starting the wake word takes the I2S mutex
+  # for the microphone. If the voice assistant has not finished releasing it,
+  # or the speaker is still playing a reply, you get either a wake word that
+  # fails to start or a reply that never comes out of the speaker. Wait for
+  # both, then leave a small margin.
+  #
+  # mode: restart so that overlapping calls - on_end and on_idle can both fire
+  # for the same turn - collapse into one.
+  # -------------------------------------------------------------------------
+  - id: restore_wake_word
+    mode: restart
+    then:
+      - lambda: id(manual_request) = false;
+      - if:
+          condition:
+            switch.is_off: use_wake_word
+          then:
+            - logger.log:
+                tag: "wake_word"
+                level: INFO
+                format: "Wake word switch is off - leaving it stopped"
+          else:
+            - wait_until:
+                condition:
+                  not:
+                    voice_assistant.is_running:
+                timeout: 5s
+            - wait_until:
+                condition:
+                  not:
+                    media_player.is_announcing:
+                timeout: 10s
+            # THE THIRD WAIT - added after the 10-second-recovery bug.
+            #
+            # "Announcing" going OFF does not mean the speaker has stopped. It
+            # keeps draining for about half a second afterwards. Measured on
+            # this board:
+            #   18:18:20.875  'Announcing'      >> OFF
+            #   18:18:21.444  'Speaker running' >> OFF     (+569 ms)
+            #
+            # The old code waited for announcing, delayed 250 ms, then checked
+            # `not speaker.is_playing` - which was evaluated at ~21.125, while
+            # the speaker still had 300 ms to run. The check failed, the script
+            # gave up, and nothing restarted the wake word until the self-heal
+            # watchdog noticed 10 s later:
+            #   18:18:31.400  Wake word idle for 10s - restarting
+            #   18:18:31.582  'Wake word listening' >> ON
+            # The wake word was coming back via the BACKSTOP every single turn.
+            #
+            # So wait for the speaker itself, not just the announcement state.
+            # The 3 s cap is what keeps the give-up behaviour for music: a song
+            # will still be playing when this expires, the check below fails,
+            # and the script correctly declines to fight for the mutex. A reply
+            # tail resolves in well under a second, so this now costs ~570 ms
+            # rather than 10 s.
+            - wait_until:
+                condition:
+                  not:
+                    speaker.is_playing: onju_speaker
+                timeout: 3s
+            # Settle margin for the I2S mutex handover. This was in the
+            # original working config and is not worth shaving.
+            - delay: 250ms
+            # If a song IS playing we still decline - taking the mic would
+            # fight the mutex, and waiting out a track could be three minutes.
+            # The media player's on_idle calls this script again when the song
+            # ends, and the self-heal watchdog is the backstop behind that.
+            - if:
+                condition:
+                  and:
+                    - not:
+                        micro_wake_word.is_running:
+                    - not:
+                        speaker.is_playing: onju_speaker
+                then:
+                  - micro_wake_word.start:
+
+  # -------------------------------------------------------------------------
+  # TIMER ALERT
+  #
+  # Flashes the ring red for up to 48 seconds, or until the touch pad is
+  # tapped - start_manual_request stops this script.
+  # -------------------------------------------------------------------------
+  - id: timer_finished
+    mode: restart
+    then:
+      - repeat:
+          count: 60
+          then:
+            - light.turn_on:
+                id: top_led
+                red: 100%
+                green: 0%
+                blue: 0%
+                effect: none
+            - delay: 400ms
+            - light.turn_off: top_led
+            - delay: 400ms
+      - script.execute: reset_led
+
+  # Idle means dark. The ring is an activity indicator only, so there is no
+  # visual difference between "listening" and "wake word switched off" - the
+  # "Wake word listening" sensor is the source of truth. If you would rather
+  # see the disabled state, set a dim colour here instead of turning off.
+  - id: reset_led
+    then:
+      - light.turn_off: top_led
+
+  - id: set_volume
+    mode: restart
+    parameters:
+      volume: float
+    then:
+      - media_player.volume_set:
+          id: onju_out
+          volume: !lambda return clamp(id(onju_out).volume+volume, 0.0f, 1.0f);
+      - light.turn_on:
+          id: top_led
+          effect: show_volume
+      - delay: 1s
+      - script.execute: reset_led
+
+  - id: turn_on_wake_word
+    then:
+      - script.execute: restore_wake_word
+      - script.execute: reset_led
+
+  - id: turn_off_wake_word
+    then:
+      - micro_wake_word.stop:
+      - voice_assistant.stop:
+      - script.execute: reset_led
+
+switch:
+  # The mute control for this device. Turning it off stops the wake word and
+  # the microphone entirely; tap-to-talk on the centre pad still works.
+  - platform: template
+    name: Use Wake Word
+    id: use_wake_word
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_on:
+      - script.execute: turn_on_wake_word
+    on_turn_off:
+      - script.execute: turn_off_wake_word
