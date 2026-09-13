@@ -36,7 +36,7 @@ wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
   power_save_mode: none
-  # Reduced from the 20.5dB default. Signal measures -57 to -66 dBm at this
+  # Reduced from the 20.5dB default. Signal measures -55 to -66 dBm at this
   # setting, which is healthy. Range is 8.5dB-20.5dB if it needs raising.
   output_power: 8.5dB
   reboot_timeout: 10min
@@ -55,16 +55,65 @@ ota:
     id: ota_esphome
     password: !secret ota_password
 
+# --- Daily 05:00 restart ------------------------------------------------------
+# A issue for this has been raised here: https://github.com/formatBCE/Respeaker-XVF3800-ESPHome-integration/issues/58
+# Mitigation, not a fix. The largest contiguous free block on the internal heap
+# drifts down with uptime (~78 KB fresh, ~49 KB after 2.6 days). Playback then
+# subtracts a roughly fixed amount, so a long uptime means playback crosses the
+# threshold where the voice assistant can no longer arm — and the audio starts
+# breaking up too. A restart resets the baseline.
+#
+# Extends the time component from packages/timers-alarm.yaml, which already has
+# an on_time entry driving the alarm check. Lists append when packages merge, so
+# both should run — verify by setting a short timer after flashing. Don't set a
+# device alarm for 05:00; timers do not survive a restart.
+
+time:
+  - id: !extend homeassistant_time
+    on_time:
+      - hours: 5
+        minutes: 0
+        seconds: 0
+        then:
+          - button.press: restart_button
+
+# --- Opportunistic restart when idle and short on contiguous heap -------------
+# Checks every 10 minutes and restarts only when ALL of these hold:
+#   * largest contiguous free block has drifted below 55 KB
+#     (~78-106 KB fresh, ~49 KB after 2.6 days; playback fails below ~43 KB)
+#   * device has been up over an hour, so it can never boot-loop
+#   * no timer pending (next_timer is -1 when none; NaN also blocks it)
+#   * media player idle - nothing playing or announcing
+#   * no voice pipeline running
+#
+# Firing leaves the heap high again, so it will not immediately re-trigger.
+# Alarms are restore_value and survive a restart; timers do not, hence the guard.
+
+interval:
+  - interval: 10min
+    then:
+      - if:
+          condition:
+            and:
+              - lambda: 'return id(heap_max_block).state < 55000;'
+              - lambda: 'return id(device_uptime).state > 3600;'
+              - lambda: 'return id(next_timer).state < 0;'
+              - media_player.is_idle:
+                  id: external_media_player
+              - not:
+                  voice_assistant.is_running:
+          then:
+            - logger.log:
+                level: WARN
+                format: "Idle, largest free block down to %.0f B - restarting"
+                args: ['id(heap_max_block).state']
+            - button.press: restart_button
+
 # --- Move audio task stacks into PSRAM ---------------------------------------
 # The mixer and both resampler speakers each run a FreeRTOS audio task whose
-# stack defaults to internal RAM. Those are large, long-lived allocations that
-# sit mid-heap and fragment it as pipelines start and stop — internal heap
-# fragmentation was measured climbing 10% -> 38% during four minutes of
-# playback and settling at 30% rather than recovering. Audio buffers are
-# already in PSRAM; these stacks were not. ESP-IDF only.
-#
-# Success looks like: fragmentation returning toward 10% after playback, and
-# Heap Min Free bottoming out well above the 51 KB seen on 2026-09-09.
+# stack defaults to internal RAM. No measurable effect on the internal-heap drop
+# during playback, but harmless and boot numbers are normal, so left in place.
+# ESP-IDF only.
 
 speaker:
   - id: !extend mixing_speaker
@@ -76,8 +125,9 @@ speaker:
 
 # --- Diagnostics -------------------------------------------------------------
 # Reset Reason distinguishes Brownout (power) from SW_CPU_RESET / task watchdog
-# (CPU starvation) after any unexpected reboot. Fragmentation and Min Free are
-# the pair that matter for the allocation failures behind "stt-stream-failed".
+# (CPU starvation) after any unexpected reboot. Heap Max Block is the one that
+# tracks the voice-assistant failure: it drops to ~39-43 KB during playback and
+# the wake word stops arming.
 
 debug:
   update_interval: 30s
@@ -89,6 +139,7 @@ text_sensor:
 
 sensor:
   - platform: uptime
+    id: device_uptime
     name: "Uptime"
   - platform: wifi_signal
     name: "WiFi Signal"
@@ -97,6 +148,7 @@ sensor:
     free:
       name: "Heap Free"
     block:
+      id: heap_max_block
       name: "Heap Max Block"
     min_free:
       name: "Heap Min Free"
@@ -106,6 +158,26 @@ sensor:
       name: "Loop Time"
     psram:
       name: "Free PSRAM"
+
+# --- Optional: force the LED ring colour at boot -----------------------------
+# The ring colour now lives in restore_value globals (user_led_ring_color_r/g/b,
+# default 255/0/255 = purple) plus the "LED Ring Color Preset" select. Because
+# they restore, a YAML initial_value no longer wins — the stored runtime value
+# does. Setting the preset once in Home Assistant persists, including across the
+# 05:00 restart, so that is the low-risk way to get blue back.
+#
+# Uncomment below only if you want it declared in config instead. NOTE: the
+# packages already define esphome.on_boot; if list merging replaces rather than
+# appends, this breaks their init sequence. Verify the LEDs still animate
+# normally after flashing.
+#
+# esphome:
+#   on_boot:
+#     - priority: -100
+#       then:
+#         - select.set:
+#             id: user_led_color_preset
+#             option: "Blue"
 
 # --- Optional extras ---------------------------------------------------------
 # Uncomment to expose the device in a specific HA area name in the logs, etc.
