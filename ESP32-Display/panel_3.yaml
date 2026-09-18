@@ -1,0 +1,1422 @@
+# =============================================================================
+# Hall Panel - Guition JC4880P443 (ESP32-P4, 480x800 driven as 800x480)
+# =============================================================================
+# Status bar   outside temp, clock, wifi
+# Page 1       Lights & plugs - tap toggles, tile turns amber when on
+# Page 2       Cameras        - tap for live video, BACK to return
+# Swipe left/right, or use the buttons at the bottom, to change page.
+#
+# EVERYTHING YOU WOULD NORMALLY CHANGE IS IN THE substitutions BLOCK BELOW.
+#
+# Changing an icon: pick one at https://pictogrammers.com/library/mdi/, take
+# its F0xxx codepoint and write it as "\U000F0xxx". The glyphs: list further
+# down reads the same substitutions, so you only edit it in one place.
+# Two tiles must not use the SAME icon, or the font gets a duplicate glyph.
+# =============================================================================
+
+substitutions:
+  # ---------------------------------------------------------------- device --
+  name: office-panel-2
+  friendly_name: Office Panel 2
+
+  # Frigate's AUTHENTICATED port. Never point this at port 5000 -- anything
+  # that can reach 5000 gets admin-equivalent access with no password at all.
+  #
+  # frigate_ip must be the FULL url, scheme and port included. https works
+  # with Frigate's default self-signed certificate -- see verify_ssl below:
+  #   frigate_ip: "https://192.168.0.138:8971"
+  frigate_url: !secret frigate_ip
+
+  # ------------------------------------------------------------ status bar --
+  temp_entity: sensor.blink_garden_1_temperature
+
+  # --------------------------------------------------- PAGE 1: lights/plugs --
+  # Any toggleable entity: light.*, switch.*, fan.*, input_boolean.* ...
+  ctl1_entity: light.office_light
+  ctl1_label: "Office Light"
+  ctl1_icon: "\U000F0769"        # ceiling-light
+
+  # A cover, so it is toggled with cover.toggle and its state is read as text
+  # (open/closed/opening/closing) rather than as an on/off binary_sensor.
+  ctl2_entity: cover.office_blinds
+  ctl2_label: "Office Blinds"
+  ctl2_icon: "\U000F00AC"        # blinds
+
+  ctl3_entity: switch.lamp_socket
+  ctl3_label: "Phone Charger"
+  ctl3_icon: "\U000F1397"        # cellphone-charging
+
+  # A script, so it is fired with script.turn_on -- homeassistant.toggle would
+  # STOP it if it happened to be running.
+  ctl4_entity: script.heating_boost_1_hour
+  ctl4_label: "Boost Heating"
+  ctl4_icon: "\U000F0E03"        # thermometer-chevron-up
+
+  # ------------------------------------------------------- PAGE 2: cameras --
+  # Home Assistant camera entity_ids. The panel reads each one's camera_name
+  # attribute over the API and streams that camera from Frigate.
+  cam1_entity: camera.back_garden
+  cam1_label: "Back Garden"
+  cam1_icon: "\U000F07AE"        # cctv
+
+  cam2_entity: camera.doorbell_2
+  cam2_label: "Doorbell"
+  cam2_icon: "\U000F0869"        # doorbell-video
+
+  cam3_entity: camera.kitchen
+  cam3_label: "Kitchen"
+  cam3_icon: "\U000F0290"        # fridge
+
+  cam4_entity: camera.living_room
+  cam4_label: "Living Room"
+  cam4_icon: "\U000F04B9"        # sofa
+
+  wifi_icon: "\U000F05A9"        # wifi
+  prev_icon: "\U000F04AE"        # skip-previous
+  next_icon: "\U000F04AD"        # skip-next
+  play_icon: "\U000F040A"        # play
+  pause_icon: "\U000F03E4"       # pause
+  media_icon: "\U000F075A"       # music
+
+  # Tiles on page 1 that open the music and Assist pages
+  media_label: "Music"
+  voice_label: "Assist"
+  ha_icon: "\U000F07D0"          # home-assistant logo
+  col_ha: "0x18BCF2"        # Home Assistant blue
+
+  # ------------------------------------------------------------------ video --
+  stream_fps: "10"          # more than the panel can draw only adds latency
+  # KEEP THIS AT 450. The camera page draws into a fixed 800x450 image widget
+  # and LVGL does not scale images, so a 16:9 camera at height 450 arrives as
+  # exactly 800x450 and fills it. Lower it and you get black bars, not a
+  # smaller picture; the only thing you save is bandwidth.
+  stream_height: "450"
+
+  # ------------------------------------------------------------------ media --
+  # Any media_player entity -- Music Assistant, Sonos, Spotify, a speaker group.
+  media_entity: media_player.office
+  # Album art is fetched straight from Home Assistant, so the panel needs to
+  # know where HA lives. Scheme and port included.
+  ha_url: !secret ha_url
+
+  # ------------------------------------------------------------- backlight --
+  # The panel dims itself when nobody has touched it for dim_after, and comes
+  # straight back on the next touch. bright_active is a fraction of the
+  # ledc max_power below, so 60% of 0.8 is ~48% of what the panel can do.
+  bright_active: "100%"
+  bright_idle: "12%"      # "0%" turns the backlight off entirely
+  dim_after: 90s
+  # Hard ceiling on the backlight. 1.0 is as bright as the panel goes;
+  # bright_active is a fraction OF this, so both have to be up for full output.
+  backlight_max: "1.0"
+
+  # ------------------------------------------------------------------ look --
+  page1_name: "OFFICE"
+  page2_name: "CAMERAS"
+  icon_size: "72"           # tile icons
+  label_font: montserrat_24 # tile labels
+  bar_font: montserrat_22   # temperature and clock
+  nav_font: montserrat_20   # page-switcher buttons
+
+  col_bg: "0x0A0D11"        # page background, near black
+  col_tile: "0x3A4046"      # tile, off - neutral grey, no blue/green tint
+  col_tile_on: "0xF07A14"   # tile, on - orange. 0xF58D10 is a touch warmer,
+                            # 0xE86A0C deeper. Yellow starts around 0xE0A32E.
+  col_text: "0xFFFFFF"      # plain white - the mint was the grey/green tone
+  col_text_on: "0x14100A"   # text on an orange tile
+  col_dim: "0xA9B1B6"       # inactive page-switcher
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    # Without this the panel comes up at whatever brightness was last saved to
+    # flash -- including one you nudged down from the Home Assistant slider
+    # weeks ago. priority -100 runs after the light component is up.
+    - priority: -100
+      then:
+        - light.turn_on:
+            id: display_backlight
+            brightness: ${bright_active}
+
+# =============================================================================
+# Hardware - you should not need to change anything below this line
+# =============================================================================
+
+esp32:
+  variant: esp32p4
+  flash_size: 16MB
+  # Most JC4880P443 panels shipped with pre-production P4 silicon. If the panel
+  # fails to boot, try commenting this line out.
+  engineering_sample: true
+  framework:
+    type: esp-idf
+    advanced:
+      enable_idf_experimental_features: true
+      execute_from_psram: true
+      # TLS 1.3 (which Frigate's port 8971 requires) depends on mbedTLS keeping
+      # the peer certificate, and ESPHome turns that off by default to save
+      # heap. Without this the handshake fails with -0x7780.
+      disable_mbedtls_peer_cert: false
+    sdkconfig_options:
+      CONFIG_ESP_MAIN_TASK_STACK_SIZE: "8192"
+      CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: "y"
+      # ESP-Hosted can fail to allocate its internal DMA pool on P4 display
+      # builds ("mempool create failed"); use dynamic buffers in PSRAM instead
+      CONFIG_ESP_HOSTED_USE_MEMPOOL: "n"
+      CONFIG_ESP_HOSTED_DFLT_TASK_FROM_SPIRAM: "y"
+      CONFIG_ESP_TASK_WDT_TIMEOUT_S: "60"
+      # (TLS 1.3 for Frigate's https port is switched on by the ha_live_camera
+      # component itself -- it also has to re-enable the mbedTLS peer-cert
+      # option that TLS 1.3 depends on, which ESPHome disables by default.)
+
+psram:
+  speed: 200MHz
+
+# LDO channel 3 powers the MIPI-DSI PHY. The display is dead without it.
+esp_ldo:
+  - channel: 3
+    voltage: 2.5V
+
+# Wi-Fi runs on the onboard ESP32-C6 over SDIO
+esp32_hosted:
+  variant: ESP32C6
+  active_high: true
+  reset_pin: GPIO54
+  clk_pin: GPIO18
+  cmd_pin: GPIO19
+  d0_pin: GPIO14
+  d1_pin: GPIO15
+  d2_pin: GPIO16
+  d3_pin: GPIO17
+  sdio_frequency: 20MHz
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "${friendly_name} Fallback"
+
+captive_portal:
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+time:
+  - platform: homeassistant
+    id: ha_time
+
+i2c:
+  sda: GPIO7
+  scl: GPIO8
+  frequency: 400kHz
+  scan: false
+
+output:
+  - platform: ledc
+    pin: GPIO23
+    id: backlight_pwm
+    # 100Hz is gentle on the backlight driver but WILL band and flicker if you
+    # point a camera at the screen. Raise to 20000Hz while filming; drop it
+    # back if the panel buzzes or the dimming goes uneven.
+    frequency: 100Hz
+    max_power: ${backlight_max}
+
+light:
+  - platform: monochromatic
+    output: backlight_pwm
+    name: Display Backlight
+    id: display_backlight
+    # ALWAYS_ON, not RESTORE_*: on_boot above decides the brightness, so there
+    # is no stale saved value to flash up first.
+    restore_mode: ALWAYS_ON
+    # A short fade makes the idle dim feel deliberate rather than like a fault.
+    default_transition_length: 500ms
+
+display:
+  - platform: mipi_dsi
+    id: panel_display
+    model: JC4880P443
+    update_interval: never
+    auto_clear_enabled: false
+
+touchscreen:
+  - platform: gt911
+    id: panel_touch
+    display: panel_display
+    # Any touch wakes the backlight. The first tap on a dimmed panel still
+    # reaches the widget underneath, which is what you want on a wall.
+    on_touch:
+      - if:
+          condition:
+            lambda: 'return id(dimmed);'
+          then:
+            - globals.set:
+                id: dimmed
+                value: 'false'
+            - light.turn_on:
+                id: display_backlight
+                brightness: ${bright_active}
+
+# =============================================================================
+# Live camera component
+# =============================================================================
+external_components:
+  - source:
+      type: git
+      url: https://github.com/derekmcauley7/ha_live_camera
+    components: [ha_live_camera]
+    # Re-clones every build. Remove once you stop changing the component.
+    refresh: 0s
+
+ha_live_camera:
+  id: live_cams
+  frigate_url: "${frigate_url}"
+  fps: ${stream_fps}
+  stream_height: ${stream_height}
+  max_width: 800          # must be a multiple of 16
+  max_height: 464         # 450 rounds up to the JPEG engine's 16px MCU size
+  max_frame_bytes: 128kB
+  rgb_order: bgr          # try "rgb" if colours look wrong
+  # Frigate's built-in certificate is self-signed, so no CA can vouch for it.
+  # false = encrypted, but the panel does not check who it is talking to --
+  # exactly what Home Assistant's own Frigate integration does with
+  # "Validate SSL" unticked. Set true only if a reverse proxy holding a real
+  # certificate sits in front of Frigate.
+  verify_ssl: false
+  # A Frigate user with the "viewer" role -- read-only, so even if the panel is
+  # compromised nobody can change your Frigate config through it.
+  username: !secret frigate_username
+  password: !secret frigate_password
+  cameras:
+    - entity_id: ${cam1_entity}
+      name: "${cam1_label}"
+    - entity_id: ${cam2_entity}
+      name: "${cam2_label}"
+    - entity_id: ${cam3_entity}
+      name: "${cam3_label}"
+    - entity_id: ${cam4_entity}
+      name: "${cam4_label}"
+  on_frame:
+    # Re-issuing src is what hands LVGL the current frame. Invalidating alone
+    # redraws whatever descriptor it captured when the widget was created.
+    - lvgl.image.update:
+        id: cam_img
+        src: live_cams
+  on_status:
+    - lvgl.label.update:
+        id: cam_status
+        text: !lambda 'return x;'
+
+# =============================================================================
+# Outside temperature -> both status bars
+# =============================================================================
+sensor:
+  - platform: homeassistant
+    id: media_volume
+    entity_id: ${media_entity}
+    attribute: volume_level
+    on_value:
+      # Guard against a feedback loop: moving the slider sets the volume, which
+      # comes back as a new state, which would move the slider again.
+      - if:
+          condition:
+            lambda: 'return !id(vol_dragging);'
+          then:
+            - lvgl.slider.update:
+                id: vol_slider
+                value: !lambda 'return x * 100.0f;'
+  - platform: homeassistant
+    id: outside_temp
+    entity_id: ${temp_entity}
+    on_value:
+      - lvgl.label.update:
+          id: temp_p1
+          text: !lambda |-
+            char b[12]; snprintf(b, sizeof(b), "%.0f°", x); return std::string(b);
+      - lvgl.label.update:
+          id: temp_p2
+          text: !lambda |-
+            char b[12]; snprintf(b, sizeof(b), "%.0f°", x); return std::string(b);
+
+# =============================================================================
+# State of the four control entities
+# =============================================================================
+binary_sensor:
+  - platform: homeassistant
+    id: ctl1_state
+    entity_id: ${ctl1_entity}
+    trigger_on_initial_state: true
+    on_state:
+      - lvgl.widget.update:
+          id: ctl1_tile
+          bg_color: !lambda 'return x ? lv_color_hex(${col_tile_on}) : lv_color_hex(${col_tile});'
+      # Text and icon flip to dark so they stay readable on amber
+      - lvgl.label.update:
+          id: ctl1_ic
+          text_color: !lambda 'return x ? lv_color_hex(${col_text_on}) : lv_color_hex(${col_text});'
+      - lvgl.label.update:
+          id: ctl1_tx
+          text_color: !lambda 'return x ? lv_color_hex(${col_text_on}) : lv_color_hex(${col_text});'
+  - platform: homeassistant
+    id: ctl3_state
+    entity_id: ${ctl3_entity}
+    trigger_on_initial_state: true
+    on_state:
+      - lvgl.widget.update:
+          id: ctl3_tile
+          bg_color: !lambda 'return x ? lv_color_hex(${col_tile_on}) : lv_color_hex(${col_tile});'
+      # Text and icon flip to dark so they stay readable on amber
+      - lvgl.label.update:
+          id: ctl3_ic
+          text_color: !lambda 'return x ? lv_color_hex(${col_text_on}) : lv_color_hex(${col_text});'
+      - lvgl.label.update:
+          id: ctl3_tx
+          text_color: !lambda 'return x ? lv_color_hex(${col_text_on}) : lv_color_hex(${col_text});'
+  - platform: homeassistant
+    id: ctl4_state
+    entity_id: ${ctl4_entity}
+    trigger_on_initial_state: true
+    on_state:
+      - lvgl.widget.update:
+          id: ctl4_tile
+          bg_color: !lambda 'return x ? lv_color_hex(${col_tile_on}) : lv_color_hex(${col_tile});'
+      # Text and icon flip to dark so they stay readable on amber
+      - lvgl.label.update:
+          id: ctl4_ic
+          text_color: !lambda 'return x ? lv_color_hex(${col_text_on}) : lv_color_hex(${col_text});'
+      - lvgl.label.update:
+          id: ctl4_tx
+          text_color: !lambda 'return x ? lv_color_hex(${col_text_on}) : lv_color_hex(${col_text});'
+
+# The blinds report open/closed/opening/closing, not on/off.
+text_sensor:
+  # entity_picture is a signed, relative path that changes with every track.
+  - platform: homeassistant
+    id: media_art
+    entity_id: ${media_entity}
+    attribute: entity_picture
+    on_value:
+      - if:
+          condition:
+            lambda: 'return !x.empty();'
+          then:
+            - online_image.set_url:
+                id: album_art
+                # entity_picture is sometimes a relative HA path
+                # (/api/media_player_proxy/...) and sometimes an absolute URL
+                # to a different host entirely -- Music Assistant serves art
+                # from its own image proxy. Only prefix the relative kind.
+                url: !lambda |-
+                  if (x.rfind("http://", 0) == 0 || x.rfind("https://", 0) == 0)
+                    return x;
+                  return std::string("${ha_url}") + x;
+            - lvgl.label.update:
+                id: art_placeholder
+                text: ""
+
+  - platform: homeassistant
+    id: media_title_src
+    entity_id: ${media_entity}
+    attribute: media_title
+    on_value:
+      - lvgl.label.update:
+          id: media_title
+          text: !lambda 'return x.empty() ? std::string("Nothing playing") : x;'
+
+  - platform: homeassistant
+    id: media_artist_src
+    entity_id: ${media_entity}
+    attribute: media_artist
+    on_value:
+      - lvgl.label.update:
+          id: media_artist
+          text: !lambda 'return x;'
+
+  # The entity state itself: playing / paused / idle / off.
+  - platform: homeassistant
+    id: media_state
+    entity_id: ${media_entity}
+    on_value:
+      - lvgl.label.update:
+          id: play_glyph
+          text: !lambda 'return x == "playing" ? std::string("${pause_icon}") : std::string("${play_icon}");'
+  - platform: homeassistant
+    id: ctl2_state
+    entity_id: ${ctl2_entity}
+    on_value:
+      - lvgl.widget.update:
+          id: ctl2_tile
+          bg_color: !lambda 'return (x == "open" || x == "opening") ? lv_color_hex(${col_tile_on}) : lv_color_hex(${col_tile});'
+      - lvgl.label.update:
+          id: ctl2_ic
+          text_color: !lambda 'return (x == "open" || x == "opening") ? lv_color_hex(${col_text_on}) : lv_color_hex(${col_text});'
+      - lvgl.label.update:
+          id: ctl2_tx
+          text_color: !lambda 'return (x == "open" || x == "opening") ? lv_color_hex(${col_text_on}) : lv_color_hex(${col_text});'
+
+# =============================================================================
+# Camera page plumbing + clock
+# =============================================================================
+script:
+  - id: open_camera
+    parameters:
+      idx: int
+      title: string
+    then:
+      - lvgl.label.update:
+          id: cam_title
+          text: !lambda 'return title;'
+      - lvgl.page.show: camera_page
+      - ha_live_camera.show:
+          id: live_cams
+          index: !lambda 'return idx;'
+
+  - id: close_camera
+    then:
+      - ha_live_camera.stop: live_cams
+      - lvgl.page.show: cameras_page
+
+  - id: open_media
+    then:
+      - lvgl.page.show: media_page
+
+  # mode: restart means a drag full of value events collapses into one call --
+  # each new event cancels the pending send and starts the wait again.
+  - id: send_volume
+    mode: restart
+    then:
+      - delay: 400ms
+      - homeassistant.action:
+          action: media_player.volume_set
+          data:
+            entity_id: ${media_entity}
+          data_template:
+            volume_level: !lambda |-
+              char b[8];
+              snprintf(b, sizeof(b), "%.2f", id(vol_pending));
+              return std::string(b);
+      # Keep ignoring incoming volume updates until HA has echoed this one back.
+      - delay: 800ms
+      - globals.set:
+          id: vol_dragging
+          value: 'false'
+
+globals:
+  - id: vol_dragging
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+  - id: vol_pending
+    type: float
+    restore_value: false
+    initial_value: '0.0f'
+
+  - id: dimmed
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+  - id: booted
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+interval:
+  # Boot screen. Runs until everything the UI depends on is actually up, then
+  # hands over once. The flag stops it dragging you back to page 1 later.
+  - interval: 500ms
+    then:
+      - if:
+          condition:
+            lambda: 'return !id(booted);'
+          then:
+            - if:
+                condition:
+                  not:
+                    wifi.connected:
+                then:
+                  - lvgl.label.update:
+                      id: boot_status
+                      text: "Connecting to Wi-Fi..."
+                else:
+                  - if:
+                      condition:
+                        not:
+                          api.connected:
+                      then:
+                        - lvgl.label.update:
+                            id: boot_status
+                            text: "Waiting for Home Assistant..."
+                      else:
+                        - if:
+                            condition:
+                              lambda: 'return !id(live_cams).cameras_ready();'
+                            then:
+                              - lvgl.label.update:
+                                  id: boot_status
+                                  text: "Loading cameras..."
+                            else:
+                              - lvgl.label.update:
+                                  id: boot_status
+                                  text: "Ready"
+                              - globals.set:
+                                  id: booted
+                                  value: 'true'
+                              - delay: 600ms
+                              - lvgl.page.show: controls_page
+
+  - interval: 1s
+    then:
+      # Clock, on both status bars
+      - lvgl.label.update:
+          id: time_p1
+          text: !lambda |-
+            auto t = id(ha_time).now();
+            if (!t.is_valid()) return std::string("--:--");
+            char b[8]; snprintf(b, sizeof(b), "%02d:%02d", t.hour, t.minute);
+            return std::string(b);
+      - lvgl.label.update:
+          id: time_p2
+          text: !lambda |-
+            auto t = id(ha_time).now();
+            if (!t.is_valid()) return std::string("--:--");
+            char b[8]; snprintf(b, sizeof(b), "%02d:%02d", t.hour, t.minute);
+            return std::string(b);
+      - if:
+          condition:
+            lambda: 'return id(live_cams).active_index() >= 0;'
+          then:
+            - lvgl.label.update:
+                id: cam_fps
+                text: !lambda |-
+                  char buf[24];
+                  snprintf(buf, sizeof(buf), "%.1f FPS", id(live_cams).measured_fps());
+                  return std::string(buf);
+
+# =============================================================================
+# Now playing
+# =============================================================================
+http_request:
+  id: http_client
+  timeout: 5s
+  verify_ssl: false
+
+# Album art. The URL is a placeholder -- the real one arrives from Home
+# Assistant as the entity_picture attribute and is set at runtime below.
+# JPEG because that is what HA's media_player_proxy serves; switch to PNG if
+# your source sends PNG artwork and the log complains about the format.
+online_image:
+  - id: album_art
+    url: "${ha_url}"
+    format: JPEG
+    type: RGB565
+    resize: 260x260
+    buffer_size: 32768
+    # LVGL calls lv_image_set_src() ONCE when the widget is built and sizes the
+    # widget from whatever the descriptor said at that moment -- which, for an
+    # image that has not downloaded yet, is nothing. Re-issuing src after every
+    # download is what actually puts pixels on screen. Exactly the same trap as
+    # the camera feed.
+    on_download_finished:
+      - lvgl.image.update:
+          id: art_img
+          src: album_art
+      - lvgl.label.update:
+          id: art_placeholder
+          text: ""
+    on_error:
+      - lvgl.label.update:
+          id: art_placeholder
+          text: "${media_icon}"
+
+# =============================================================================
+# Icon font
+# =============================================================================
+# Every icon used above appears here too -- both read the same substitution,
+# so changing one at the top changes both.
+font:
+  - file: "https://raw.githubusercontent.com/Templarian/MaterialDesign-Webfont/v7.4.47/fonts/materialdesignicons-webfont.ttf"
+    id: transport_font
+    size: 52
+    bpp: 4
+    glyphs:
+      - ${prev_icon}
+      - ${next_icon}
+      - ${play_icon}
+      - ${pause_icon}
+  - file: "https://raw.githubusercontent.com/Templarian/MaterialDesign-Webfont/v7.4.47/fonts/materialdesignicons-webfont.ttf"
+    id: art_font
+    size: 110
+    bpp: 4
+    glyphs:
+      - ${media_icon}
+  - file: "https://raw.githubusercontent.com/Templarian/MaterialDesign-Webfont/v7.4.47/fonts/materialdesignicons-webfont.ttf"
+    id: icon_font
+    size: ${icon_size}
+    bpp: 4
+    glyphs:
+      - ${ctl1_icon}
+      - ${ctl2_icon}
+      - ${ctl3_icon}
+      - ${ctl4_icon}
+      - ${cam1_icon}
+      - ${cam2_icon}
+      - ${cam3_icon}
+      - ${cam4_icon}
+      - ${media_icon}
+  - file: "https://raw.githubusercontent.com/Templarian/MaterialDesign-Webfont/v7.4.47/fonts/materialdesignicons-webfont.ttf"
+    id: ha_font
+    size: 150
+    bpp: 4
+    glyphs:
+      - ${ha_icon}
+  - file: "https://raw.githubusercontent.com/Templarian/MaterialDesign-Webfont/v7.4.47/fonts/materialdesignicons-webfont.ttf"
+    id: status_font
+    size: 26
+    bpp: 4
+    glyphs:
+      - ${wifi_icon}
+
+# =============================================================================
+# UI
+# =============================================================================
+lvgl:
+  id: main_lvgl
+  on_idle:
+    timeout: ${dim_after}
+    then:
+      - globals.set:
+          id: dimmed
+          value: 'true'
+      - light.turn_on:
+          id: display_backlight
+          brightness: ${bright_idle}
+  displays: panel_display
+  touchscreens: panel_touch
+  buffer_size: 100%
+  byte_order: little_endian
+  # 480x800 panel driven as 800x480. Use 270 if it comes up upside down.
+  rotation: 90
+  bg_color: ${col_bg}
+
+  style_definitions:
+    - id: tile_style
+      bg_opa: cover
+      border_width: 0
+      radius: 16
+      pad_all: 16
+      text_color: ${col_text}
+
+  pages:
+    # Declared first, so this is what LVGL shows the moment the display is up.
+    # skip: true keeps it out of the swipe rotation once we have left it.
+    - id: boot_page
+      skip: true
+      bg_color: ${col_bg}
+      bg_opa: cover
+      scrollbar_mode: "off"
+      widgets:
+        - label:
+            align: center
+            y: -80
+            text_font: ha_font
+            text_color: ${col_ha}
+            text: "${ha_icon}"
+
+        - label:
+            align: center
+            y: 60
+            text_font: montserrat_28
+            text_color: ${col_text}
+            text: "${friendly_name}"
+
+        - spinner:
+            align: center
+            y: 130
+            width: 42
+            height: 42
+            spin_time: 1s
+            arc_length: 60deg
+            arc_color: ${col_tile}
+            arc_width: 5
+            indicator:
+              arc_color: ${col_tile_on}
+              arc_width: 5
+
+        - label:
+            id: boot_status
+            align: center
+            y: 190
+            text_font: montserrat_20
+            text_color: ${col_dim}
+            text: "Starting..."
+
+    - id: controls_page
+      bg_color: ${col_bg}
+      bg_opa: cover
+      scrollbar_mode: "off"
+      pad_all: 12
+      # Swipe either way to reach the other page.
+      # lv_indev_wait_release() stops LVGL delivering anything else
+      # from this touch, so the tile underneath never gets its click.
+      on_swipe_left:
+        - lambda: "lv_indev_wait_release(lv_indev_active());"
+        - lvgl.page.show: cameras_page
+      on_swipe_right:
+        - lambda: "lv_indev_wait_release(lv_indev_active());"
+        - lvgl.page.show: cameras_page
+      layout:
+        type: grid
+        grid_columns: [FR(1), FR(1), FR(1), FR(1), FR(1), FR(1)]
+        # status bar, two rows of tiles, page switcher
+        grid_rows: [30, FR(1), FR(1), 54]
+        pad_row: 10
+        pad_column: 10
+      widgets:
+        - obj:
+            grid_cell_column_pos: 0
+            grid_cell_row_pos: 0
+            grid_cell_column_span: 6
+            grid_cell_x_align: stretch
+            grid_cell_y_align: stretch
+            bg_opa: transp
+            border_width: 0
+            pad_all: 0
+            clickable: false
+            widgets:
+              - label:
+                  id: temp_p1
+                  align: left_mid
+                  text_font: ${bar_font}
+                  text_color: ${col_text}
+                  text: "--°"
+              - label:
+                  id: time_p1
+                  align: center
+                  text_font: ${bar_font}
+                  text_color: ${col_text}
+                  text: "--:--"
+              - label:
+                  align: right_mid
+                  text_font: status_font
+                  text_color: ${col_text}
+                  text: "${wifi_icon}"
+        - button:
+            id: ctl1_tile
+            styles: tile_style
+            bg_color: ${col_tile}
+            grid_cell_column_pos: 0
+            grid_cell_column_span: 2
+            grid_cell_row_pos: 1
+            grid_cell_x_align: stretch
+            grid_cell_y_align: stretch
+            gesture_bubble: true
+            widgets:
+              - label:
+                  id: ctl1_ic
+                  align: top_left
+                  text_font: icon_font
+                  text_color: ${col_text}
+                  text: "${ctl1_icon}"
+              - label:
+                  id: ctl1_tx
+                  align: bottom_left
+                  width: 100%
+                  long_mode: dot
+                  text_font: ${label_font}
+                  text_color: ${col_text}
+                  text: "${ctl1_label}"
+            on_click:
+              - homeassistant.action:
+                  action: homeassistant.toggle
+                  data:
+                    entity_id: ${ctl1_entity}
+        - button:
+            id: ctl2_tile
+            styles: tile_style
+            bg_color: ${col_tile}
+            grid_cell_column_pos: 2
+            grid_cell_column_span: 2
+            grid_cell_row_pos: 1
+            grid_cell_x_align: stretch
+            grid_cell_y_align: stretch
+            gesture_bubble: true
+            widgets:
+              - label:
+                  id: ctl2_ic
+                  align: top_left
+                  text_font: icon_font
+                  text_color: ${col_text}
+                  text: "${ctl2_icon}"
+              - label:
+                  id: ctl2_tx
+                  align: bottom_left
+                  width: 100%
+                  long_mode: dot
+                  text_font: ${label_font}
+                  text_color: ${col_text}
+                  text: "${ctl2_label}"
+            on_click:
+              - homeassistant.action:
+                  action: cover.toggle
+                  data:
+                    entity_id: ${ctl2_entity}
+        - button:
+            id: ctl3_tile
+            styles: tile_style
+            bg_color: ${col_tile}
+            grid_cell_column_pos: 4
+            grid_cell_column_span: 2
+            grid_cell_row_pos: 1
+            grid_cell_x_align: stretch
+            grid_cell_y_align: stretch
+            gesture_bubble: true
+            widgets:
+              - label:
+                  id: ctl3_ic
+                  align: top_left
+                  text_font: icon_font
+                  text_color: ${col_text}
+                  text: "${ctl3_icon}"
+              - label:
+                  id: ctl3_tx
+                  align: bottom_left
+                  width: 100%
+                  long_mode: dot
+                  text_font: ${label_font}
+                  text_color: ${col_text}
+                  text: "${ctl3_label}"
+            on_click:
+              - homeassistant.action:
+                  action: homeassistant.toggle
+                  data:
+                    entity_id: ${ctl3_entity}
+        - button:
+            id: ctl4_tile
+            styles: tile_style
+            bg_color: ${col_tile}
+            grid_cell_column_pos: 0
+            grid_cell_column_span: 2
+            grid_cell_row_pos: 2
+            grid_cell_x_align: stretch
+            grid_cell_y_align: stretch
+            gesture_bubble: true
+            widgets:
+              - label:
+                  id: ctl4_ic
+                  align: top_left
+                  text_font: icon_font
+                  text_color: ${col_text}
+                  text: "${ctl4_icon}"
+              - label:
+                  id: ctl4_tx
+                  align: bottom_left
+                  width: 100%
+                  long_mode: dot
+                  text_font: ${label_font}
+                  text_color: ${col_text}
+                  text: "${ctl4_label}"
+            on_click:
+              - homeassistant.action:
+                  action: script.turn_on
+                  data:
+                    entity_id: ${ctl4_entity}
+        - button:
+            id: media_tile
+            styles: tile_style
+            bg_color: ${col_tile}
+            grid_cell_column_pos: 2
+            grid_cell_column_span: 2
+            grid_cell_row_pos: 2
+            grid_cell_x_align: stretch
+            grid_cell_y_align: stretch
+            gesture_bubble: true
+            widgets:
+              - label:
+                  align: top_left
+                  text_font: icon_font
+                  text_color: ${col_text}
+                  text: "${media_icon}"
+              - label:
+                  align: bottom_left
+                  width: 100%
+                  long_mode: dot
+                  text_font: ${label_font}
+                  text_color: ${col_text}
+                  text: "${media_label}"
+            on_click:
+              - script.execute: open_media
+        - button:
+            grid_cell_column_pos: 0
+            grid_cell_column_span: 3
+            grid_cell_row_pos: 3
+            grid_cell_x_align: stretch
+            grid_cell_y_align: stretch
+            bg_color: ${col_tile_on}
+            bg_opa: cover
+            radius: 12
+            border_width: 0
+            pad_all: 0
+            gesture_bubble: true
+            widgets:
+              - label:
+                  align: center
+                  text_font: ${nav_font}
+                  text_color: ${col_text_on}
+                  text: "${page1_name}"
+        - button:
+            grid_cell_column_pos: 3
+            grid_cell_column_span: 3
+            grid_cell_row_pos: 3
+            grid_cell_x_align: stretch
+            grid_cell_y_align: stretch
+            bg_color: ${col_tile}
+            bg_opa: cover
+            radius: 12
+            border_width: 0
+            pad_all: 0
+            gesture_bubble: true
+            widgets:
+              - label:
+                  align: center
+                  text_font: ${nav_font}
+                  text_color: ${col_dim}
+                  text: "${page2_name}"
+            on_click:
+              - lvgl.page.show: cameras_page
+
+    - id: cameras_page
+      bg_color: ${col_bg}
+      bg_opa: cover
+      scrollbar_mode: "off"
+      pad_all: 12
+      # Swipe either way to reach the other page.
+      # lv_indev_wait_release() stops LVGL delivering anything else
+      # from this touch, so the tile underneath never gets its click.
+      on_swipe_left:
+        - lambda: "lv_indev_wait_release(lv_indev_active());"
+        - lvgl.page.show: controls_page
+      on_swipe_right:
+        - lambda: "lv_indev_wait_release(lv_indev_active());"
+        - lvgl.page.show: controls_page
+      layout:
+        type: grid
+        grid_columns: [FR(1), FR(1), FR(1), FR(1), FR(1), FR(1)]
+        # status bar, two rows of tiles, page switcher
+        grid_rows: [30, FR(1), FR(1), 54]
+        pad_row: 10
+        pad_column: 10
+      widgets:
+        - obj:
+            grid_cell_column_pos: 0
+            grid_cell_row_pos: 0
+            grid_cell_column_span: 6
+            grid_cell_x_align: stretch
+            grid_cell_y_align: stretch
+            bg_opa: transp
+            border_width: 0
+            pad_all: 0
+            clickable: false
+            widgets:
+              - label:
+                  id: temp_p2
+                  align: left_mid
+                  text_font: ${bar_font}
+                  text_color: ${col_text}
+                  text: "--°"
+              - label:
+                  id: time_p2
+                  align: center
+                  text_font: ${bar_font}
+                  text_color: ${col_text}
+                  text: "--:--"
+              - label:
+                  align: right_mid
+                  text_font: status_font
+                  text_color: ${col_text}
+                  text: "${wifi_icon}"
+        - button:
+            id: cam1_tile
+            styles: tile_style
+            bg_color: ${col_tile}
+            grid_cell_column_pos: 0
+            grid_cell_column_span: 3
+            grid_cell_row_pos: 1
+            grid_cell_x_align: stretch
+            grid_cell_y_align: stretch
+            gesture_bubble: true
+            widgets:
+              - label:
+                  id: cam1_ic
+                  align: top_left
+                  text_font: icon_font
+                  text_color: ${col_text}
+                  text: "${cam1_icon}"
+              - label:
+                  id: cam1_tx
+                  align: bottom_left
+                  width: 100%
+                  long_mode: dot
+                  text_font: ${label_font}
+                  text_color: ${col_text}
+                  text: "${cam1_label}"
+            on_click:
+              - script.execute:
+                  id: open_camera
+                  idx: 0
+                  title: "${cam1_label}"
+        - button:
+            id: cam2_tile
+            styles: tile_style
+            bg_color: ${col_tile}
+            grid_cell_column_pos: 3
+            grid_cell_column_span: 3
+            grid_cell_row_pos: 1
+            grid_cell_x_align: stretch
+            grid_cell_y_align: stretch
+            gesture_bubble: true
+            widgets:
+              - label:
+                  id: cam2_ic
+                  align: top_left
+                  text_font: icon_font
+                  text_color: ${col_text}
+                  text: "${cam2_icon}"
+              - label:
+                  id: cam2_tx
+                  align: bottom_left
+                  width: 100%
+                  long_mode: dot
+                  text_font: ${label_font}
+                  text_color: ${col_text}
+                  text: "${cam2_label}"
+            on_click:
+              - script.execute:
+                  id: open_camera
+                  idx: 1
+                  title: "${cam2_label}"
+        - button:
+            id: cam3_tile
+            styles: tile_style
+            bg_color: ${col_tile}
+            grid_cell_column_pos: 0
+            grid_cell_column_span: 3
+            grid_cell_row_pos: 2
+            grid_cell_x_align: stretch
+            grid_cell_y_align: stretch
+            gesture_bubble: true
+            widgets:
+              - label:
+                  id: cam3_ic
+                  align: top_left
+                  text_font: icon_font
+                  text_color: ${col_text}
+                  text: "${cam3_icon}"
+              - label:
+                  id: cam3_tx
+                  align: bottom_left
+                  width: 100%
+                  long_mode: dot
+                  text_font: ${label_font}
+                  text_color: ${col_text}
+                  text: "${cam3_label}"
+            on_click:
+              - script.execute:
+                  id: open_camera
+                  idx: 2
+                  title: "${cam3_label}"
+        - button:
+            id: cam4_tile
+            styles: tile_style
+            bg_color: ${col_tile}
+            grid_cell_column_pos: 3
+            grid_cell_column_span: 3
+            grid_cell_row_pos: 2
+            grid_cell_x_align: stretch
+            grid_cell_y_align: stretch
+            gesture_bubble: true
+            widgets:
+              - label:
+                  id: cam4_ic
+                  align: top_left
+                  text_font: icon_font
+                  text_color: ${col_text}
+                  text: "${cam4_icon}"
+              - label:
+                  id: cam4_tx
+                  align: bottom_left
+                  width: 100%
+                  long_mode: dot
+                  text_font: ${label_font}
+                  text_color: ${col_text}
+                  text: "${cam4_label}"
+            on_click:
+              - script.execute:
+                  id: open_camera
+                  idx: 3
+                  title: "${cam4_label}"
+        - button:
+            grid_cell_column_pos: 0
+            grid_cell_column_span: 3
+            grid_cell_row_pos: 3
+            grid_cell_x_align: stretch
+            grid_cell_y_align: stretch
+            bg_color: ${col_tile}
+            bg_opa: cover
+            radius: 12
+            border_width: 0
+            pad_all: 0
+            gesture_bubble: true
+            widgets:
+              - label:
+                  align: center
+                  text_font: ${nav_font}
+                  text_color: ${col_dim}
+                  text: "${page1_name}"
+            on_click:
+              - lvgl.page.show: controls_page
+        - button:
+            grid_cell_column_pos: 3
+            grid_cell_column_span: 3
+            grid_cell_row_pos: 3
+            grid_cell_x_align: stretch
+            grid_cell_y_align: stretch
+            bg_color: ${col_tile_on}
+            bg_opa: cover
+            radius: 12
+            border_width: 0
+            pad_all: 0
+            gesture_bubble: true
+            widgets:
+              - label:
+                  align: center
+                  text_font: ${nav_font}
+                  text_color: ${col_text_on}
+                  text: "${page2_name}"
+
+    # Live video. skip: true keeps it out of the swipe rotation.
+    - id: camera_page
+      skip: true
+      bg_color: "0x000000"
+      bg_opa: cover
+      scrollbar_mode: "off"
+      widgets:
+        # Declared first so the controls below paint on top of it.
+        - image:
+            id: cam_img
+            src: live_cams
+            x: 0
+            y: 15
+            width: 800
+            height: 450
+
+        - label:
+            id: cam_title
+            x: 14
+            y: 10
+            text_font: montserrat_22
+            text_color: ${col_text}
+            text: "Camera"
+
+        - button:
+            id: cam_back
+            x: 676
+            y: 8
+            width: 110
+            height: 46
+            bg_color: ${col_tile}
+            bg_opa: cover
+            radius: 12
+            border_width: 0
+            widgets:
+              - label:
+                  align: center
+                  text_color: ${col_text}
+                  text_font: montserrat_20
+                  text: "BACK"
+            on_click:
+              - script.execute: close_camera
+
+        - label:
+            id: cam_status
+            x: 14
+            y: 452
+            text_font: montserrat_18
+            text_color: ${col_text}
+            text: "Idle"
+
+        - label:
+            id: cam_fps
+            x: 682
+            y: 452
+            text_font: montserrat_18
+            text_color: ${col_text}
+            text: "-- FPS"
+
+    # Now playing. skip: true keeps it out of the swipe rotation.
+    - id: media_page
+      skip: true
+      bg_color: ${col_bg}
+      bg_opa: cover
+      scrollbar_mode: "off"
+      widgets:
+        # Art sits on a tile-coloured square so an empty slot still looks
+        # intentional; the placeholder glyph shows through until art arrives.
+        - obj:
+            x: 40
+            y: 60
+            width: 260
+            height: 260
+            bg_color: ${col_tile}
+            bg_opa: cover
+            radius: 16
+            border_width: 0
+            pad_all: 0
+            clickable: false
+            widgets:
+              - label:
+                  id: art_placeholder
+                  align: center
+                  text_font: art_font
+                  text_color: ${col_dim}
+                  text: "${media_icon}"
+              - image:
+                  id: art_img
+                  align: center
+                  src: album_art
+
+        - label:
+            id: media_title
+            x: 336
+            y: 70
+            width: 424
+            long_mode: dot
+            text_font: montserrat_28
+            text_color: ${col_text}
+            text: "Nothing playing"
+
+        - label:
+            id: media_artist
+            x: 336
+            y: 116
+            width: 424
+            long_mode: dot
+            text_font: montserrat_20
+            text_color: ${col_dim}
+            text: ""
+
+        - button:
+            x: 336
+            y: 176
+            width: 76
+            height: 68
+            bg_color: ${col_tile}
+            bg_opa: cover
+            radius: 12
+            border_width: 0
+            pad_all: 0
+            widgets:
+              - label:
+                  align: center
+                  text_font: transport_font
+                  text_color: ${col_text}
+                  text: "${prev_icon}"
+            on_click:
+              - homeassistant.action:
+                  action: media_player.media_previous_track
+                  data:
+                    entity_id: ${media_entity}
+
+        - button:
+            x: 424
+            y: 176
+            width: 96
+            height: 68
+            bg_color: ${col_tile_on}
+            bg_opa: cover
+            radius: 12
+            border_width: 0
+            pad_all: 0
+            widgets:
+              - label:
+                  id: play_glyph
+                  align: center
+                  text_font: transport_font
+                  text_color: ${col_text_on}
+                  text: "${play_icon}"
+            on_click:
+              - homeassistant.action:
+                  action: media_player.media_play_pause
+                  data:
+                    entity_id: ${media_entity}
+
+        - button:
+            x: 532
+            y: 176
+            width: 76
+            height: 68
+            bg_color: ${col_tile}
+            bg_opa: cover
+            radius: 12
+            border_width: 0
+            pad_all: 0
+            widgets:
+              - label:
+                  align: center
+                  text_font: transport_font
+                  text_color: ${col_text}
+                  text: "${next_icon}"
+            on_click:
+              - homeassistant.action:
+                  action: media_player.media_next_track
+                  data:
+                    entity_id: ${media_entity}
+
+        - slider:
+            id: vol_slider
+            x: 336
+            y: 280
+            width: 424
+            height: 18
+            min_value: 0
+            max_value: 100
+            indicator:
+              bg_color: ${col_tile_on}
+            knob:
+              bg_color: ${col_text}
+            # x is the slider's new value, handed straight to the trigger --
+            # no need to reach into the LVGL object, whose type is opaque here.
+            on_value:
+              - globals.set:
+                  id: vol_dragging
+                  value: 'true'
+              - lambda: 'id(vol_pending) = x / 100.0f;'
+              - script.execute: send_volume
+
+        - button:
+            x: 676
+            y: 414
+            width: 110
+            height: 46
+            bg_color: ${col_tile}
+            bg_opa: cover
+            radius: 12
+            border_width: 0
+            widgets:
+              - label:
+                  align: center
+                  text_color: ${col_text}
+                  text_font: montserrat_20
+                  text: "BACK"
+            on_click:
+              - lvgl.page.show: controls_page
