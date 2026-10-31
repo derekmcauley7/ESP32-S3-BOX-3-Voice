@@ -197,6 +197,9 @@ esp32:
     type: arduino
     advanced:
       enable_idf_experimental_features: true
+psram:
+  mode: octal
+  speed: 80MHz
 logger:
   hardware_uart: UART0
   level: INFO
